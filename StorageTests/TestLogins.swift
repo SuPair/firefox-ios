@@ -7,7 +7,7 @@ import Shared
 import XCTest
 import XCGLogger
 
-private let log = XCGLogger.defaultInstance()
+private let log = XCGLogger.appInstance()
 
 class TestSQLiteLogins: XCTestCase {
     var db: BrowserDB!
