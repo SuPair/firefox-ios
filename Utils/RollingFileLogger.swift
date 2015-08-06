@@ -8,7 +8,7 @@ import XCGLogger
 //// A rolling file loggers that saves to a different log file based on given timestamp
 public class RollingFileLogger: XCGLogger {
 
-    private static let FiveMbsInBytes: UInt64 = 5 * 100000
+    private static let FiveMBsInBytes: UInt64 = 5 * 100000
     private let sizeLimit: UInt64
     private let logDirectoryPath: String?
 
@@ -17,13 +17,13 @@ public class RollingFileLogger: XCGLogger {
 
     private static let DateFormatter: NSDateFormatter = {
         let formatter = NSDateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss_z"
+        formatter.dateFormat = "yyyyMMdd'T'HHmmssZ"
         return formatter
     }()
 
     let root: String
 
-    init(filenameRoot: String, logDirectoryPath: String?, sizeLimit: UInt64 = FiveMbsInBytes) {
+    init(filenameRoot: String, logDirectoryPath: String?, sizeLimit: UInt64 = FiveMBsInBytes) {
         root = filenameRoot
         self.sizeLimit = sizeLimit
         self.logDirectoryPath = logDirectoryPath
@@ -57,24 +57,17 @@ public class RollingFileLogger: XCGLogger {
     }
 
     private func deleteOldestLog() {
-        var logFiles = savedLogFilenames()
-        logFiles.sort { $0 < $1 }
-
-        if let oldestLogFilename = logFiles.first,
-           let dir = logDirectoryPath {
-            NSFileManager.defaultManager().removeItemAtPath("\(dir)/\(oldestLogFilename)", error: nil)
-        }
-    }
-
-    private func savedLogFilenames() -> [String] {
         if logDirectoryPath == nil {
-            return []
+            return
         }
 
         if var logFiles = NSFileManager.defaultManager().contentsOfDirectoryAtPath(logDirectoryPath!, error: nil) as? [String] {
-            return logFiles.filter { $0.startsWith("\(self.root).") }
-        } else {
-            return []
+            logFiles = logFiles.filter { $0.startsWith("\(self.root).") }
+            logFiles.sort { $0 < $1 }
+
+            if let oldestLogFilename = logFiles.first {
+                NSFileManager.defaultManager().removeItemAtPath("\(logDirectoryPath!)/\(oldestLogFilename)", error: nil)
+            }
         }
     }
 
@@ -83,21 +76,23 @@ public class RollingFileLogger: XCGLogger {
             return 0
         }
 
-        return savedLogFilenames().reduce(0) {
-            if let attributes = NSFileManager.defaultManager().attributesOfItemAtPath("\(logDirectoryPath!)/\($0.1)", error: &error) {
-               return (attributes[NSFileSize] as! NSNumber).unsignedLongLongValue
-            } else {
-                return 0
+        let logDirURL = NSURL(fileURLWithPath: logDirectoryPath!)
+        var dirSize: UInt64 = 0
+        var errorValue: NSError?
+        if !NSFileManager.defaultManager().nr_getAllocatedSize(&dirSize, ofDirectoryAtURL: logDirURL, error: &errorValue) {
+            if let errorValue = errorValue {
+                error("Error determining log directory size: \(errorValue)")
             }
         }
+        return dirSize
     }
 
     private func filenameWithRoot(root: String, withDate date: NSDate) -> String? {
         if let dir = logDirectoryPath {
             return "\(dir)/\(root).\(RollingFileLogger.DateFormatter.stringFromDate(date)).log"
-        } else {
-            return nil
         }
+
+        return nil
     }
 
     private func fileLogIdentifierWithRoot(root: String) -> String {
