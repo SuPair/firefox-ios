@@ -7,82 +7,104 @@ import Shared
 import Storage
 import XCGLogger
 import WebKit
+import Deferred
+import SwiftyJSON
 
-private let log = XCGLogger.defaultInstance()
+private let log = Logger.browserLogger
 
-private let SaveButtonTitle = NSLocalizedString("Save", comment: "Button to save the user's password")
-private let NotNowButtonTitle = NSLocalizedString("Not now", comment: "Button to not save the user's password")
-private let UpdateButtonTitle = NSLocalizedString("Update", comment: "Button to update the user's password")
-private let CancelButtonTitle = NSLocalizedString("Cancel", comment: "Authentication prompt cancel button")
-private let LogInButtonTitle  = NSLocalizedString("Log in", comment: "Authentication prompt log in button")
+class LoginsHelper: TabContentScript {
+    fileprivate weak var tab: Tab?
+    fileprivate let profile: Profile
+    fileprivate var snackBar: SnackBar?
 
-class LoginsHelper: BrowserHelper {
-    private weak var browser: Browser?
-    private let profile: Profile
-    private var snackBar: SnackBar?
-    private static let MaxAuthenticationAttempts = 3
+    // Exposed for mocking purposes
+    var logins: BrowserLogins {
+        return profile.logins
+    }
 
     class func name() -> String {
         return "LoginsHelper"
     }
 
-    required init(browser: Browser, profile: Profile) {
-        self.browser = browser
+    required init(tab: Tab, profile: Profile) {
+        self.tab = tab
         self.profile = profile
-
-        if let path = NSBundle.mainBundle().pathForResource("LoginsHelper", ofType: "js") {
-            if let source = NSString(contentsOfFile: path, encoding: NSUTF8StringEncoding, error: nil) as? String {
-                var userScript = WKUserScript(source: source, injectionTime: WKUserScriptInjectionTime.AtDocumentEnd, forMainFrameOnly: true)
-                browser.webView!.configuration.userContentController.addUserScript(userScript)
-            }
-        }
     }
 
     func scriptMessageHandlerName() -> String? {
         return "loginsManagerMessageHandler"
     }
 
-    func userContentController(userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
-        var res = message.body as! [String: String]
-        let type = res["type"]
-        if let url = browser?.url {
-            if type == "request" {
-                res["username"] = ""
-                res["password"] = ""
-                let login = Login.fromScript(url, script: res)
-                requestLogins(login, requestId: res["requestId"]!)
+    func userContentController(_ userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
+        guard var res = message.body as? [String: AnyObject] else { return }
+        guard let type = res["type"] as? String else { return }
+
+        // Check to see that we're in the foreground before trying to check the logins. We want to
+        // make sure we don't try accessing the logins database while we're backgrounded to avoid
+        // the system from terminating our app due to background disk access.
+        //
+        // See https://bugzilla.mozilla.org/show_bug.cgi?id=1307822 for details.
+        guard UIApplication.shared.applicationState == .active && !profile.isShutdown else {
+            return
+        }
+
+        // We don't use the WKWebView's URL since the page can spoof the URL by using document.location
+        // right before requesting login data. See bug 1194567 for more context.
+        if let url = message.frameInfo.request.url {
+            // Since responses go to the main frame, make sure we only listen for main frame requests
+            // to avoid XSS attacks.
+            if message.frameInfo.isMainFrame && type == "request" {
+                res["username"] = "" as AnyObject?
+                res["password"] = "" as AnyObject?
+                if let login = Login.fromScript(url, script: res),
+                   let requestId = res["requestId"] as? String {
+                    requestLogins(login, requestId: requestId)
+                }
             } else if type == "submit" {
-                setCredentials(Login.fromScript(url, script: res))
+                if self.profile.prefs.boolForKey("saveLogins") ?? true {
+                    if let login = Login.fromScript(url, script: res) {
+                        setCredentials(login)
+                    }
+                }
             }
         }
     }
 
-    class func replace(base: String, keys: [String], replacements: [String]) -> NSMutableAttributedString {
+    class func replace(_ base: String, keys: [String], replacements: [String]) -> NSMutableAttributedString {
         var ranges = [NSRange]()
         var string = base
-        for (index, key) in enumerate(keys) {
+        for (index, key) in keys.enumerated() {
             let replace = replacements[index]
-            let range = string.rangeOfString(key,
-                options: NSStringCompareOptions.LiteralSearch,
+            let range = string.range(of: key,
+                options: .literal,
                 range: nil,
                 locale: nil)!
-            string.replaceRange(range, with: replace)
-            let nsRange = NSMakeRange(distance(string.startIndex, range.startIndex),
-                count(replace))
+            string.replaceSubrange(range, with: replace)
+            let nsRange = NSRange(location: string.distance(from: string.startIndex, to: range.lowerBound),
+                                  length: replace.count)
             ranges.append(nsRange)
         }
 
-        var attributes = [NSObject: AnyObject]()
-        attributes[NSFontAttributeName] = UIFont.systemFontOfSize(13, weight: UIFontWeightRegular)
-        attributes[NSForegroundColorAttributeName] = UIColor.darkGrayColor()
-        var attr = NSMutableAttributedString(string: string, attributes: attributes)
-        for (index, range) in enumerate(ranges) {
-            attr.addAttribute(NSFontAttributeName, value: UIFont.systemFontOfSize(13, weight: UIFontWeightMedium), range: range)
+        var attributes = [NSAttributedStringKey: AnyObject]()
+        attributes[NSAttributedStringKey.font] = UIFont.systemFont(ofSize: 13, weight: UIFont.Weight.regular)
+        attributes[NSAttributedStringKey.foregroundColor] = UIColor.Photon.Grey60
+        let attr = NSMutableAttributedString(string: string, attributes: attributes)
+        let font: UIFont = UIFont.systemFont(ofSize: 13, weight: UIFont.Weight.medium)
+        for range in ranges {
+            attr.addAttribute(NSAttributedStringKey.font, value: font, range: range)
         }
         return attr
     }
 
-    private func setCredentials(login: LoginData) {
+    func getLoginsForProtectionSpace(_ protectionSpace: URLProtectionSpace) -> Deferred<Maybe<Cursor<LoginData>>> {
+        return profile.logins.getLoginsForProtectionSpace(protectionSpace)
+    }
+
+    func updateLoginByGUID(_ guid: GUID, new: LoginData, significant: Bool) -> Success {
+        return profile.logins.updateLoginByGUID(guid, new: new, significant: significant)
+    }
+
+    func setCredentials(_ login: LoginData) {
         if login.password.isEmpty {
             log.debug("Empty password")
             return
@@ -90,7 +112,7 @@ class LoginsHelper: BrowserHelper {
 
         profile.logins
                .getLoginsForProtectionSpace(login.protectionSpace, withUsername: login.username)
-               .uponQueue(dispatch_get_main_queue()) { res in
+               .uponQueue(.main) { res in
             if let data = res.successValue {
                 log.debug("Found \(data.count) logins.")
                 for saved in data {
@@ -110,174 +132,87 @@ class LoginsHelper: BrowserHelper {
         }
     }
 
-    private func promptSave(login: LoginData) {
-        let promptMessage: NSAttributedString
+    fileprivate func promptSave(_ login: LoginData) {
+        guard login.isValid.isSuccess else {
+            return
+        }
+
+        let promptMessage: String
         if let username = login.username {
-            let promptStringFormat = NSLocalizedString("Do you want to save the password for %@ on %@?", comment: "Prompt for saving a password. The first parameter is the username being saved. The second parameter is the hostname of the site.")
-            promptMessage = NSAttributedString(string: String(format: promptStringFormat, username, login.hostname))
+            promptMessage = String(format: Strings.SaveLoginUsernamePrompt, username, login.hostname)
         } else {
-            let promptStringFormat = NSLocalizedString("Do you want to save the password on %@?", comment: "Prompt for saving a password with no username. The parameter is the hostname of the site.")
-            promptMessage = NSAttributedString(string: String(format: promptStringFormat, login.hostname))
+            promptMessage = String(format: Strings.SaveLoginPrompt, login.hostname)
         }
 
-        if snackBar != nil {
-            browser?.removeSnackbar(snackBar!)
+        if let existingPrompt = self.snackBar {
+            tab?.removeSnackbar(existingPrompt)
         }
 
-        snackBar = TimerSnackBar(attrText: promptMessage,
-            img: UIImage(named: "lock_verified"),
-            buttons: [
-                SnackButton(title: SaveButtonTitle, callback: { (bar: SnackBar) -> Void in
-                    self.browser?.removeSnackbar(bar)
-                    self.snackBar = nil
-                    self.profile.logins.addLogin(login)
-                }),
-
-                SnackButton(title: NotNowButtonTitle, callback: { (bar: SnackBar) -> Void in
-                    self.browser?.removeSnackbar(bar)
-                    self.snackBar = nil
-                    return
-                })
-            ])
-        browser?.addSnackbar(snackBar!)
+        snackBar = TimerSnackBar(text: promptMessage, img: UIImage(named: "key"))
+        let dontSave = SnackButton(title: Strings.LoginsHelperDontSaveButtonTitle, accessibilityIdentifier: "SaveLoginPrompt.dontSaveButton", bold: false) { bar in
+            self.tab?.removeSnackbar(bar)
+            self.snackBar = nil
+            return
+        }
+        let save = SnackButton(title: Strings.LoginsHelperSaveLoginButtonTitle, accessibilityIdentifier: "SaveLoginPrompt.saveLoginButton", bold: true) { bar in
+            self.tab?.removeSnackbar(bar)
+            self.snackBar = nil
+            self.profile.logins.addLogin(login)
+            LeanPlumClient.shared.track(event: .savedLoginAndPassword)
+        }
+        snackBar?.addButton(dontSave)
+        snackBar?.addButton(save)
+        tab?.addSnackbar(snackBar!)
     }
 
-    private func promptUpdateFromLogin(login old: LoginData, toLogin new: LoginData) {
+    fileprivate func promptUpdateFromLogin(login old: LoginData, toLogin new: LoginData) {
+        guard new.isValid.isSuccess else {
+            return
+        }
+
         let guid = old.guid
 
         let formatted: String
         if let username = new.username {
-            let promptStringFormat = NSLocalizedString("Do you want to update the password for %@ on %@?", comment: "Prompt for updating a password. The first parameter is the username being saved. The second parameter is the hostname of the site.")
-            formatted = String(format: promptStringFormat, username, new.hostname)
+            formatted = String(format: Strings.UpdateLoginUsernamePrompt, username, new.hostname)
         } else {
-            let promptStringFormat = NSLocalizedString("Do you want to update the password on %@?", comment: "Prompt for updating a password with on username. The parameter is the hostname of the site.")
-            formatted = String(format: promptStringFormat, new.hostname)
-        }
-        let promptMessage = NSAttributedString(string: formatted)
-
-        if snackBar != nil {
-            browser?.removeSnackbar(snackBar!)
+            formatted = String(format: Strings.UpdateLoginPrompt, new.hostname)
         }
 
-        snackBar = TimerSnackBar(attrText: promptMessage,
-            img: UIImage(named: "lock_verified"),
-            buttons: [
-                SnackButton(title: UpdateButtonTitle, callback: { (bar: SnackBar) -> Void in
-                    self.browser?.removeSnackbar(bar)
-                    self.snackBar = nil
-                    self.profile.logins.updateLoginByGUID(guid, new: new,
-                                                          significant: new.isSignificantlyDifferentFrom(old))
-                }),
-                SnackButton(title: NotNowButtonTitle, callback: { (bar: SnackBar) -> Void in
-                    self.browser?.removeSnackbar(bar)
-                    self.snackBar = nil
-                    return
-                })
-            ])
-        browser?.addSnackbar(snackBar!)
+        if let existingPrompt = self.snackBar {
+            tab?.removeSnackbar(existingPrompt)
+        }
+
+        snackBar = TimerSnackBar(text: formatted, img: UIImage(named: "key"))
+        let dontSave = SnackButton(title: Strings.LoginsHelperDontUpdateButtonTitle, accessibilityIdentifier: "UpdateLoginPrompt.donttUpdateButton", bold: false) { bar in
+            self.tab?.removeSnackbar(bar)
+            self.snackBar = nil
+            return
+        }
+        let update = SnackButton(title: Strings.LoginsHelperUpdateButtonTitle, accessibilityIdentifier: "UpdateLoginPrompt.updateButton", bold: true) { bar in
+            self.tab?.removeSnackbar(bar)
+            self.snackBar = nil
+            self.profile.logins.updateLoginByGUID(guid, new: new, significant: new.isSignificantlyDifferentFrom(old))
+        }
+        snackBar?.addButton(dontSave)
+        snackBar?.addButton(update)
+        tab?.addSnackbar(snackBar!)
     }
 
-    private func requestLogins(login: LoginData, requestId: String) {
-        profile.logins.getLoginsForProtectionSpace(login.protectionSpace).uponQueue(dispatch_get_main_queue()) { res in
-            var jsonObj = [String: AnyObject]()
+    fileprivate func requestLogins(_ login: LoginData, requestId: String) {
+        profile.logins.getLoginsForProtectionSpace(login.protectionSpace).uponQueue(.main) { res in
+            var jsonObj = [String: Any]()
             if let cursor = res.successValue {
                 log.debug("Found \(cursor.count) logins.")
                 jsonObj["requestId"] = requestId
                 jsonObj["name"] = "RemoteLogins:loginsFound"
-                jsonObj["logins"] = map(cursor, { $0!.toDict() })
+                jsonObj["logins"] = cursor.map { $0!.toDict() }
             }
 
             let json = JSON(jsonObj)
-            let src = "window.__firefox__.logins.inject(\(json.toString()))"
-            self.browser?.webView?.evaluateJavaScript(src, completionHandler: { (obj, err) -> Void in
+            let src = "window.__firefox__.logins.inject(\(json.stringify()!))"
+            self.tab?.webView?.evaluateJavaScript(src, completionHandler: { (obj, err) -> Void in
             })
         }
     }
-
-    func handleAuthRequest(viewController: UIViewController, challenge: NSURLAuthenticationChallenge) -> Deferred<Result<LoginData>> {
-        // If there have already been too many login attempts, we'll just fail.
-        if challenge.previousFailureCount >= LoginsHelper.MaxAuthenticationAttempts {
-            return deferResult(LoginDataError(description: "Too many attempts to open site"))
-        }
-
-        var credential = challenge.proposedCredential
-
-        // If we were passed an initial set of credentials from iOS, try and use them.
-        if let proposed = credential {
-            if !(proposed.user?.isEmpty ?? true) {
-                if challenge.previousFailureCount == 0 {
-                    return deferResult(Login.createWithCredential(credential!, protectionSpace: challenge.protectionSpace))
-                }
-            } else {
-                credential = nil
-            }
-        }
-
-        if let credential = credential {
-            // If we have some credentials, we'll show a prompt with them.
-            return promptForUsernamePassword(viewController, credentials: credential, protectionSpace: challenge.protectionSpace)
-        }
-
-        // Otherwise, try to look one up
-        let options = QueryOptions(filter: challenge.protectionSpace.host, filterType: .None, sort: .None)
-        return profile.logins.getLoginsForProtectionSpace(challenge.protectionSpace).bindQueue(dispatch_get_main_queue()) { res in
-            let credentials = res.successValue?[0]?.credentials
-            return self.promptForUsernamePassword(viewController, credentials: credentials, protectionSpace: challenge.protectionSpace)
-        }
-    }
-
-    private func promptForUsernamePassword(viewController: UIViewController, credentials: NSURLCredential?, protectionSpace: NSURLProtectionSpace) -> Deferred<Result<LoginData>> {
-        if protectionSpace.host.isEmpty {
-            println("Unable to show a password prompt without a hostname")
-            return deferResult(LoginDataError(description: "Unable to show a password prompt without a hostname"))
-        }
-
-        let deferred = Deferred<Result<LoginData>>()
-        let alert: UIAlertController
-        let title = NSLocalizedString("Authentication required", comment: "Authentication prompt title")
-        if !(protectionSpace.realm?.isEmpty ?? true) {
-            let msg = NSLocalizedString("A username and password are being requested by %@. The site says: %@", comment: "Authentication prompt message with a realm. First parameter is the hostname. Second is the realm string")
-            let formatted = NSString(format: msg, protectionSpace.host, protectionSpace.realm ?? "") as String
-            alert = UIAlertController(title: title, message: formatted, preferredStyle: UIAlertControllerStyle.Alert)
-        } else {
-            let msg = NSLocalizedString("A username and password are being requested by %@.", comment: "Authentication prompt message with no realm. Parameter is the hostname of the site")
-            let formatted = NSString(format: msg, protectionSpace.host) as String
-            alert = UIAlertController(title: title, message: formatted, preferredStyle: UIAlertControllerStyle.Alert)
-        }
-
-        // Add a button to log in.
-        let action = UIAlertAction(title: LogInButtonTitle,
-            style: UIAlertActionStyle.Default) { (action) -> Void in
-                let user = (alert.textFields?[0] as! UITextField).text
-                let pass = (alert.textFields?[1] as! UITextField).text
-
-                let login = Login.createWithCredential(NSURLCredential(user: user, password: pass, persistence: .ForSession), protectionSpace: protectionSpace)
-                deferred.fill(Result(success: login))
-                self.setCredentials(login)
-        }
-        alert.addAction(action)
-
-        // Add a cancel button.
-        let cancel = UIAlertAction(title: CancelButtonTitle, style: UIAlertActionStyle.Cancel) { (action) -> Void in
-            deferred.fill(Result(failure: LoginDataError(description: "Save password cancelled")))
-        }
-        alert.addAction(cancel)
-
-        // Add a username textfield.
-        alert.addTextFieldWithConfigurationHandler { (textfield) -> Void in
-            textfield.placeholder = NSLocalizedString("Username", comment: "Username textbox in Authentication prompt")
-            textfield.text = credentials?.user
-        }
-
-        // Add a password textfield.
-        alert.addTextFieldWithConfigurationHandler { (textfield) -> Void in
-            textfield.placeholder = NSLocalizedString("Password", comment: "Password textbox in Authentication prompt")
-            textfield.secureTextEntry = true
-            textfield.text = credentials?.password
-        }
-        
-        viewController.presentViewController(alert, animated: true) { () -> Void in }
-        return deferred
-    }
-    
 }

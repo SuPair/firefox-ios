@@ -2,44 +2,45 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-import XCGLogger
 import UIKit
 import Shared
 
-private let log = XCGLogger.defaultInstance()
-
-public class SuggestedSite: Site {
-    public let wordmark: Favicon
-    public let backgroundColor: UIColor
+open class SuggestedSite: Site {
+    override open var tileURL: URL {
+        return URL(string: url as String) ?? URL(string: "about:blank")!
+    }
 
     let trackingId: Int
-    init(json: JSON) {
-        self.backgroundColor = UIColor(colorString: json["bgcolor"].asString!)
-        self.trackingId = json["trackingid"].asInt ?? 0
-        self.wordmark = Favicon(url: json["imageurl"].asString!, date: NSDate(), type: .Icon)
-
-        super.init(url: json["url"].asString!, title: json["title"].asString!)
-
-        self.icon = Favicon(url: json["faviconUrl"].asString!, date: NSDate(), type: .Icon)
+    init(data: SuggestedSiteData) {
+        self.trackingId = data.trackingId
+        super.init(url: data.url, title: data.title, bookmarked: nil)
+        self.guid = "default" + data.title // A guid is required in the case the site might become a pinned site
     }
 }
 
-public let SuggestedSites: SuggestedSitesData<SuggestedSite> = SuggestedSitesData<SuggestedSite>()
+public let SuggestedSites: SuggestedSitesCursor = SuggestedSitesCursor()
 
-public class SuggestedSitesData<T>: ArrayCursor<SuggestedSite> {
-    private init() {
-        // TODO: Make this list localized. That should be as simple as making sure it's in the lproj directory.
-        var err: NSError? = nil
-        let path = NSBundle.mainBundle().pathForResource("suggestedsites", ofType: "json")
-        let data = NSString(contentsOfFile: path!, encoding: NSUTF8StringEncoding, error: &err)
-        let json = JSON.parse(data as! String)
-
-        var tiles = [SuggestedSite]()
-        for i in 0..<json.length {
-            let t = SuggestedSite(json: json[i])
-            tiles.append(t)
-        }
-
-        super.init(data: tiles, status: .Success, statusMessage: "Loaded")
+open class SuggestedSitesCursor: ArrayCursor<SuggestedSite> {
+    fileprivate init() {
+        let locale = Locale.current
+        let sites = DefaultSuggestedSites.sites[locale.identifier] ??
+                    DefaultSuggestedSites.sites["default"]! as Array<SuggestedSiteData>
+        let tiles = sites.map({ data -> SuggestedSite in
+            var site = data
+            if let domainMap = DefaultSuggestedSites.urlMap[data.url], let localizedURL = domainMap[locale.identifier] {
+                site.url = localizedURL
+            }
+            return SuggestedSite(data: site)
+        })
+        super.init(data: tiles, status: .success, statusMessage: "Loaded")
     }
+}
+
+public struct SuggestedSiteData {
+    var url: String
+    var bgColor: String
+    var imageUrl: String
+    var faviconUrl: String
+    var trackingId: Int
+    var title: String
 }

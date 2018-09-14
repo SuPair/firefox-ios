@@ -3,9 +3,10 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import Shared
+import Deferred
 
-public class IgnoredSiteError: ErrorType {
-    public var description: String {
+open class IgnoredSiteError: MaybeErrorType {
+    open var description: String {
         return "Ignored site."
     }
 }
@@ -18,56 +19,87 @@ public class IgnoredSiteError: ErrorType {
  * `clear` might or might not need to set a bunch of flags to upload deletions.
  */
 public protocol BrowserHistory {
-    func addLocalVisit(visit: SiteVisit) -> Success
+    @discardableResult func addLocalVisit(_ visit: SiteVisit) -> Success
     func clearHistory() -> Success
-    func removeHistoryForURL(url: String) -> Success
-    func removeSiteFromTopSites(site: Site) -> Success
+    @discardableResult func removeHistoryForURL(_ url: String) -> Success
+    func removeSiteFromTopSites(_ site: Site) -> Success
+    func removeHostFromTopSites(_ host: String) -> Success
+    func getFrecentHistory() -> FrecentHistory
+    func getSitesByLastVisit(limit: Int, offset: Int) -> Deferred<Maybe<Cursor<Site>>>
+    func getTopSitesWithLimit(_ limit: Int) -> Deferred<Maybe<Cursor<Site>>>
+    func setTopSitesNeedsInvalidation()
+    func setTopSitesCacheSize(_ size: Int32)
+    func clearTopSitesCache() -> Success
 
-    func getSitesByFrecencyWithLimit(limit: Int) -> Deferred<Result<Cursor<Site>>>
-    func getSitesByFrecencyWithLimit(limit: Int, whereURLContains filter: String) -> Deferred<Result<Cursor<Site>>>
-    func getSitesByLastVisit(limit: Int) -> Deferred<Result<Cursor<Site>>>
+    // Pinning top sites
+    func removeFromPinnedTopSites(_ site: Site) -> Success
+    func addPinnedTopSite(_ site: Site) -> Success
+    func getPinnedTopSites() -> Deferred<Maybe<Cursor<Site>>>
+    func isPinnedTopSite(_ url: String) -> Deferred<Maybe<Bool>>
+}
+
+/**
+ * An interface for fast repeated frecency queries.
+ */
+public protocol FrecentHistory {
+    func getSites(whereURLContains filter: String?, historyLimit limit: Int, bookmarksLimit: Int) -> Deferred<Maybe<Cursor<Site>>>
+    func updateTopSitesCacheQuery() -> (String, Args?)
+}
+
+/**
+ * An interface for accessing recommendation content from Storage
+ */
+public protocol HistoryRecommendations {
+    func getHighlights() -> Deferred<Maybe<Cursor<Site>>>
+    func getRecentBookmarks(_ limit: Int) -> Deferred<Maybe<Cursor<Site>>>
+
+    func removeHighlightForURL(_ url: String) -> Success
+    func repopulate(invalidateTopSites shouldInvalidateTopSites: Bool, invalidateHighlights shouldInvalidateHighlights: Bool) -> Success
 }
 
 /**
  * The interface that history storage needs to provide in order to be
  * synced by a `HistorySynchronizer`.
  */
-public protocol SyncableHistory {
+public protocol SyncableHistory: AccountRemovalDelegate {
     /**
      * Make sure that the local place with the provided URL has the provided GUID.
      * Succeeds if no place exists with that URL.
      */
-    func ensurePlaceWithURL(url: String, hasGUID guid: GUID) -> Success
+    func ensurePlaceWithURL(_ url: String, hasGUID guid: GUID) -> Success
 
     /**
      * Delete the place with the provided GUID, and all of its visits. Succeeds if the GUID is unknown.
      */
-    func deleteByGUID(guid: GUID, deletedAt: Timestamp) -> Success
+    func deleteByGUID(_ guid: GUID, deletedAt: Timestamp) -> Success
 
-    func storeRemoteVisits(visits: [Visit], forGUID guid: GUID) -> Success
-    func insertOrUpdatePlace(place: Place, modified: Timestamp) -> Deferred<Result<GUID>>
+    func storeRemoteVisits(_ visits: [Visit], forGUID guid: GUID) -> Success
+    func insertOrUpdatePlace(_ place: Place, modified: Timestamp) -> Deferred<Maybe<GUID>>
 
-    func getModifiedHistoryToUpload() -> Deferred<Result<[(Place, [Visit])]>>
-    func getDeletedHistoryToUpload() -> Deferred<Result<[GUID]>>
+    func getModifiedHistoryToUpload() -> Deferred<Maybe<[(Place, [Visit])]>>
+    func getDeletedHistoryToUpload() -> Deferred<Maybe<[GUID]>>
 
     /**
      * Chains through the provided timestamp.
      */
-    func markAsSynchronized([GUID], modified: Timestamp) -> Deferred<Result<Timestamp>>
-    func markAsDeleted(guids: [GUID]) -> Success
+    func markAsSynchronized(_: [GUID], modified: Timestamp) -> Deferred<Maybe<Timestamp>>
+    func markAsDeleted(_ guids: [GUID]) -> Success
+
+    func doneApplyingRecordsAfterDownload() -> Success
+    func doneUpdatingMetadataAfterUpload() -> Success
 
     /**
-     * Clean up any metadata.
+     * For inspecting whether we're an active participant in history sync.
      */
-    func onRemovedAccount() -> Success
+    func hasSyncedHistory() -> Deferred<Maybe<Bool>>
 }
 
 // TODO: integrate Site with this.
 
-public class Place {
-    public let guid: GUID
-    public let url: String
-    public let title: String
+open class Place {
+    open let guid: GUID
+    open let url: String
+    open let title: String
 
     public init(guid: GUID, url: String, title: String) {
         self.guid = guid

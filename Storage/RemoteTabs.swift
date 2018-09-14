@@ -4,13 +4,14 @@
 
 import Foundation
 import Shared
+import Deferred
 
-public struct ClientAndTabs: Equatable, Printable {
+public struct ClientAndTabs: Equatable, CustomStringConvertible {
     public let client: RemoteClient
     public let tabs: [RemoteTab]
 
     public var description: String {
-        return "<Client \(client.guid), \(tabs.count) tabs.>"
+        return "<Client guid: \(client.guid ?? "nil"), \(tabs.count) tabs.>"
     }
 
     // See notes in RemoteTabsPanel.swift.
@@ -19,7 +20,7 @@ public struct ClientAndTabs: Equatable, Printable {
             return client.modified
         }
 
-        return tabs.reduce(Timestamp(0), combine: { m, tab in
+        return tabs.reduce(Timestamp(0), { m, tab in
             return max(m, tab.lastUsed)
         })
     }
@@ -31,50 +32,53 @@ public func ==(lhs: ClientAndTabs, rhs: ClientAndTabs) -> Bool {
 }
 
 public protocol RemoteClientsAndTabs: SyncCommands {
-    func wipeClients() -> Deferred<Result<()>>
-    func wipeRemoteTabs() -> Deferred<Result<()>>
-    func wipeTabs() -> Deferred<Result<()>>
-    func getClients() -> Deferred<Result<[RemoteClient]>>
-    func getClientsAndTabs() -> Deferred<Result<[ClientAndTabs]>>
-    func getTabsForClientWithGUID(guid: GUID?) -> Deferred<Result<[RemoteTab]>>
-    func insertOrUpdateClient(client: RemoteClient) -> Deferred<Result<()>>
-    func insertOrUpdateClients(clients: [RemoteClient]) -> Deferred<Result<()>>
+    func wipeClients() -> Deferred<Maybe<()>>
+    func wipeRemoteTabs() -> Deferred<Maybe<()>>
+    func wipeTabs() -> Deferred<Maybe<()>>
+    func getClientGUIDs() -> Deferred<Maybe<Set<GUID>>>
+    func getClients() -> Deferred<Maybe<[RemoteClient]>>
+    func getClient(guid: GUID) -> Deferred<Maybe<RemoteClient?>>
+    func getClient(fxaDeviceId: String) -> Deferred<Maybe<RemoteClient?>>
+    func getRemoteDevices() -> Deferred<Maybe<[RemoteDevice]>>
+    func getClientsAndTabs() -> Deferred<Maybe<[ClientAndTabs]>>
+    func getTabsForClientWithGUID(_ guid: GUID?) -> Deferred<Maybe<[RemoteTab]>>
+    func insertOrUpdateClient(_ client: RemoteClient) -> Deferred<Maybe<Int>>
+    func insertOrUpdateClients(_ clients: [RemoteClient]) -> Deferred<Maybe<Int>>
 
     // Returns number of tabs inserted.
-    func insertOrUpdateTabs(tabs: [RemoteTab]) -> Deferred<Result<Int>> // Insert into the local client.
-    func insertOrUpdateTabsForClientGUID(clientGUID: String?, tabs: [RemoteTab]) -> Deferred<Result<Int>>
+    func insertOrUpdateTabs(_ tabs: [RemoteTab]) -> Deferred<Maybe<Int>> // Insert into the local client.
+    func insertOrUpdateTabsForClientGUID(_ clientGUID: String?, tabs: [RemoteTab]) -> Deferred<Maybe<Int>>
 
-    func onRemovedAccount() -> Success
+    func deleteClient(guid: GUID) -> Success
 }
 
 public struct RemoteTab: Equatable {
     public let clientGUID: String?
-    public let URL: NSURL
+    public let URL: Foundation.URL
     public let title: String
-    public let history: [NSURL]
+    public let history: [Foundation.URL]
     public let lastUsed: Timestamp
-    public let icon: NSURL?
+    public let icon: Foundation.URL?
 
-    public static func shouldIncludeURL(url: NSURL) -> Bool {
-        if let scheme = url.scheme {
-            if scheme == "about" {
+    public static func shouldIncludeURL(_ url: Foundation.URL) -> Bool {
+        let scheme = url.scheme
+        if scheme == "about" {
+            return false
+        }
+        if scheme == "javascript" {
+            return false
+        }
+
+        if let hostname = url.host?.lowercased() {
+            if hostname == "localhost" {
                 return false
             }
-            if scheme == "javascript" {
-                return false
-            }
-
-            if let hostname = url.host?.lowercaseString {
-                if hostname == "localhost" {
-                    return false
-                }
-                return true
-            }
+            return true
         }
         return false
     }
 
-    public init(clientGUID: String?, URL: NSURL, title: String, history: [NSURL], lastUsed: Timestamp, icon: NSURL?) {
+    public init(clientGUID: String?, URL: Foundation.URL, title: String, history: [Foundation.URL], lastUsed: Timestamp, icon: Foundation.URL?) {
         self.clientGUID = clientGUID
         self.URL = URL
         self.title = title
@@ -83,7 +87,7 @@ public struct RemoteTab: Equatable {
         self.icon = icon
     }
 
-    public func withClientGUID(clientGUID: String?) -> RemoteTab {
+    public func withClientGUID(_ clientGUID: String?) -> RemoteTab {
         return RemoteTab(clientGUID: clientGUID, URL: URL, title: title, history: history, lastUsed: lastUsed, icon: icon)
     }
 }
@@ -97,8 +101,8 @@ public func ==(lhs: RemoteTab, rhs: RemoteTab) -> Bool {
         lhs.icon == rhs.icon
 }
 
-extension RemoteTab: Printable {
+extension RemoteTab: CustomStringConvertible {
     public var description: String {
-        return "<RemoteTab clientGUID: \(clientGUID), URL: \(URL), title: \(title), lastUsed: \(lastUsed)>"
+        return "<RemoteTab clientGUID: \(clientGUID ?? "nil"), URL: \(URL), title: \(title), lastUsed: \(lastUsed)>"
     }
 }

@@ -5,12 +5,24 @@
 import Foundation
 import WebKit
 import Shared
+import Deferred
 import XCGLogger
 
-private var log = XCGLogger.defaultInstance()
+private var log = Logger.syncLogger
+
+enum SyncStatus: Int {
+    // Ordinarily not needed; synced items are removed from the overlay. But they start here when cloned.
+    case synced = 0
+
+    // A material change that we want to upload on next sync.
+    case changed = 1
+
+    // Created locally.
+    case new = 2
+}
 
 public enum CommutativeLoginField {
-    case TimesUsed(increment: Int)
+    case timesUsed(increment: Int)
 }
 
 public protocol Indexable {
@@ -18,32 +30,32 @@ public protocol Indexable {
 }
 
 public enum NonCommutativeLoginField: Indexable {
-    case Hostname(to: String)
-    case Password(to: String)
-    case Username(to: String?)
-    case HTTPRealm(to: String?)
-    case FormSubmitURL(to: String?)
-    case TimeCreated(to: MicrosecondTimestamp)                  // Should be immutable.
-    case TimeLastUsed(to: MicrosecondTimestamp)
-    case TimePasswordChanged(to: MicrosecondTimestamp)
+    case hostname(to: String)
+    case password(to: String)
+    case username(to: String?)
+    case httpRealm(to: String?)
+    case formSubmitURL(to: String?)
+    case timeCreated(to: MicrosecondTimestamp)                  // Should be immutable.
+    case timeLastUsed(to: MicrosecondTimestamp)
+    case timePasswordChanged(to: MicrosecondTimestamp)
 
     public var index: Int {
         switch self {
-        case .Hostname:
+        case .hostname:
             return 0
-        case .Password:
+        case .password:
             return 1
-        case .Username:
+        case .username:
             return 2
-        case .HTTPRealm:
+        case .httpRealm:
             return 3
-        case .FormSubmitURL:
+        case .formSubmitURL:
             return 4
-        case .TimeCreated:
+        case .timeCreated:
             return 5
-        case .TimeLastUsed:
+        case .timeLastUsed:
             return 6
-        case .TimePasswordChanged:
+        case .timePasswordChanged:
             return 7
         }
     }
@@ -56,14 +68,14 @@ public enum NonCommutativeLoginField: Indexable {
 // We handle them in the same way as NonCommutative, just broken out to allow us
 // flexibility in removing them or reconciling them differently.
 public enum NonConflictingLoginField: Indexable {
-    case UsernameField(to: String?)
-    case PasswordField(to: String?)
+    case usernameField(to: String?)
+    case passwordField(to: String?)
 
     public var index: Int {
         switch self {
-        case .UsernameField:
+        case .usernameField:
             return 0
-        case .PasswordField:
+        case .passwordField:
             return 1
         }
     }
@@ -82,10 +94,10 @@ public typealias TimestampedLoginDeltas = (at: Timestamp, changed: LoginDeltas)
 /**
  * LoginData is a wrapper around NSURLCredential and NSURLProtectionSpace to allow us to add extra fields where needed.
  **/
-public protocol LoginData: class {
+public protocol LoginData: AnyObject {
     var guid: String { get set }                 // It'd be nice if this were read-only.
-    var credentials: NSURLCredential { get }
-    var protectionSpace: NSURLProtectionSpace { get }
+    var credentials: URLCredential { get }
+    var protectionSpace: URLProtectionSpace { get }
     var hostname: String { get }
     var username: String? { get }
     var password: String { get }
@@ -93,10 +105,14 @@ public protocol LoginData: class {
     var formSubmitURL: String? { get set }
     var usernameField: String? { get set }
     var passwordField: String? { get set }
+    var isValid: Maybe<()> { get }
+
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=1238103
+    var hasMalformedHostname: Bool { get set }
 
     func toDict() -> [String: String]
 
-    func isSignificantlyDifferentFrom(login: LoginData) -> Bool
+    func isSignificantlyDifferentFrom(_ login: LoginData) -> Bool
 }
 
 public protocol LoginUsageData {
@@ -106,37 +122,45 @@ public protocol LoginUsageData {
     var timePasswordChanged: MicrosecondTimestamp { get set }
 }
 
-public class Login: Printable, LoginData, LoginUsageData, Equatable {
-    public var guid: String
+open class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatable {
+    open var guid: String
 
-    public let credentials: NSURLCredential
-    public let protectionSpace: NSURLProtectionSpace
+    open fileprivate(set) var credentials: URLCredential
+    open let protectionSpace: URLProtectionSpace
 
-    public var hostname: String { return protectionSpace.host }
-    public var username: String? { return credentials.user }
-    public var password: String { return credentials.password! }
-    public var usernameField: String? = nil
-    public var passwordField: String? = nil
+    open var hostname: String {
+        if let _ = protectionSpace.`protocol` {
+            return protectionSpace.urlString()
+        }
+        return protectionSpace.host
+    }
 
-    private var _httpRealm: String? = nil
-    public var httpRealm: String? {
+    open var hasMalformedHostname: Bool = false
+
+    open var username: String? { return credentials.user }
+    open var password: String { return credentials.password ?? "" }
+    open var usernameField: String?
+    open var passwordField: String?
+
+    fileprivate var _httpRealm: String?
+    open var httpRealm: String? {
         get { return self._httpRealm ?? protectionSpace.realm }
         set { self._httpRealm = newValue }
     }
 
-    private var _formSubmitURL: String? = nil
-    public var formSubmitURL: String? {
+    fileprivate var _formSubmitURL: String?
+    open var formSubmitURL: String? {
         get {
             return self._formSubmitURL
         }
         set(value) {
-            if value == nil || value!.isEmpty {
+            guard let value = value, !value.isEmpty else {
                 self._formSubmitURL = nil
                 return
             }
 
-            let url2 = NSURL(string: self.hostname)
-            let url1 = NSURL(string: value!)
+            let url2 = URL(string: self.hostname)
+            let url1 = URL(string: value)
 
             if url1?.host != url2?.host {
                 log.warning("Form submit URL domain doesn't match login's domain.")
@@ -147,19 +171,51 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
     }
 
     // LoginUsageData. These defaults only apply to locally created records.
-    public var timesUsed = 0
-    public var timeCreated = NSDate.nowMicroseconds()
-    public var timeLastUsed = NSDate.nowMicroseconds()
-    public var timePasswordChanged = NSDate.nowMicroseconds()
+    open var timesUsed = 0
+    open var timeCreated = Date.nowMicroseconds()
+    open var timeLastUsed = Date.nowMicroseconds()
+    open var timePasswordChanged = Date.nowMicroseconds()
 
     // Printable
-    public var description: String {
+    open var description: String {
         return "Login for \(hostname)"
+    }
+
+    open var isValid: Maybe<()> {
+        // Referenced from https://mxr.mozilla.org/mozilla-central/source/toolkit/components/passwordmgr/nsLoginManager.js?rev=f76692f0fcf8&mark=280-281#271
+
+        // Logins with empty hostnames are not valid.
+        if hostname.isEmpty {
+            return Maybe(failure: LoginDataError(description: "Can't add a login with an empty hostname."))
+        }
+
+        // Logins with empty passwords are not valid.
+        if password.isEmpty {
+            return Maybe(failure: LoginDataError(description: "Can't add a login with an empty password."))
+        }
+
+        // Logins with both a formSubmitURL and httpRealm are not valid.
+        if let _ = formSubmitURL, let _ = httpRealm {
+            return Maybe(failure: LoginDataError(description: "Can't add a login with both a httpRealm and formSubmitURL."))
+        }
+
+        // Login must have at least a formSubmitURL or httpRealm.
+        if (formSubmitURL == nil) && (httpRealm == nil) {
+            return Maybe(failure: LoginDataError(description: "Can't add a login without a httpRealm or formSubmitURL."))
+        }
+
+        // All good.
+        return Maybe(success: ())
+    }
+
+    open func update(password: String, username: String) {
+        self.credentials =
+            URLCredential(user: username, password: password, persistence: credentials.persistence)
     }
 
     // Essentially: should we sync a change?
     // Desktop ignores usernameField and hostnameField.
-    public func isSignificantlyDifferentFrom(login: LoginData) -> Bool {
+    open func isSignificantlyDifferentFrom(_ login: LoginData) -> Bool {
         return login.password != self.password ||
                login.hostname != self.hostname ||
                login.username != self.username ||
@@ -167,18 +223,37 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
                login.httpRealm != self.httpRealm
     }
 
-    public class func createWithHostname(hostname: String, username: String, password: String) -> LoginData {
+    /* Used for testing purposes since formSubmitURL should be given back to use from the Logins.js script */
+    open class func createWithHostname(_ hostname: String, username: String, password: String, formSubmitURL: String?) -> LoginData {
+        let loginData = Login(hostname: hostname, username: username, password: password) as LoginData
+        loginData.formSubmitURL = formSubmitURL
+        return loginData
+    }
+
+    open class func createWithHostname(_ hostname: String, username: String, password: String) -> LoginData {
         return Login(hostname: hostname, username: username, password: password) as LoginData
     }
 
-    public class func createWithCredential(credential: NSURLCredential, protectionSpace: NSURLProtectionSpace) -> LoginData {
+    open class func createWithCredential(_ credential: URLCredential, protectionSpace: URLProtectionSpace) -> LoginData {
         return Login(credential: credential, protectionSpace: protectionSpace) as LoginData
     }
 
     public init(guid: String, hostname: String, username: String, password: String) {
         self.guid = guid
-        self.credentials = NSURLCredential(user: username, password: password, persistence: NSURLCredentialPersistence.None)
-        self.protectionSpace = NSURLProtectionSpace(host: hostname, port: 0, `protocol`: nil, realm: nil, authenticationMethod: nil)
+        self.credentials = URLCredential(user: username, password: password, persistence: .none)
+
+        // Break down the full url hostname into its scheme/protocol and host components
+        let hostnameURL = hostname.asURL
+        let host = hostnameURL?.host ?? hostname
+        let scheme = hostnameURL?.scheme ?? ""
+
+        // We should ignore any SSL or normal web ports in the URL.
+        var port = hostnameURL?.port ?? 0
+        if port == 443 || port == 80 {
+            port = 0
+        }
+
+        self.protectionSpace = URLProtectionSpace(host: host, port: port, protocol: scheme, realm: nil, authenticationMethod: nil)
     }
 
     convenience init(hostname: String, username: String, password: String) {
@@ -190,13 +265,13 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
     // SO: http://stackoverflow.com/questions/26280176/swift-generics-not-preserving-type
     // Playground: https://gist.github.com/rnewman/3fb0c4dbd25e7fda7e3d
     // Conversation: https://twitter.com/rnewman/status/611332618412359680
-    required public init(credential: NSURLCredential, protectionSpace: NSURLProtectionSpace) {
+    required public init(credential: URLCredential, protectionSpace: URLProtectionSpace) {
         self.guid = Bytes.generateGUID()
         self.credentials = credential
         self.protectionSpace = protectionSpace
     }
 
-    public func toDict() -> [String: String] {
+    open func toDict() -> [String: String] {
         return [
             "hostname": hostname,
             "formSubmitURL": formSubmitURL ?? "",
@@ -208,36 +283,47 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
         ]
     }
 
-    public class func fromScript(url: NSURL, script: [String: String]) -> LoginData {
-        let login = Login(hostname: getPasswordOrigin(url.absoluteString!)!, username: script["username"]!, password: script["password"]!)
+    open class func fromScript(_ url: URL, script: [String: Any]) -> LoginData? {
+        guard let username = script["username"] as? String,
+              let password = script["password"] as? String else {
+                return nil
+        }
 
-        if let formSubmit = script["formSubmitURL"] {
+        guard let origin = getPasswordOrigin(url.absoluteString) else {
+            return nil
+        }
+
+        let login = Login(hostname: origin, username: username, password: password)
+
+        if let formSubmit = script["formSubmitURL"] as? String {
             login.formSubmitURL = formSubmit
         }
 
-        if let passwordField = script["passwordField"] {
+        if let passwordField = script["passwordField"] as? String {
             login.passwordField = passwordField
         }
 
-        if let userField = script["usernameField"] {
+        if let userField = script["usernameField"] as? String {
             login.usernameField = userField
         }
 
         return login as LoginData
     }
 
-    private class func getPasswordOrigin(uriString: String, allowJS: Bool = false) -> String? {
+    fileprivate class func getPasswordOrigin(_ uriString: String, allowJS: Bool = false) -> String? {
         var realm: String? = nil
-        if let uri = NSURL(string: uriString) {
-            if allowJS && uri.scheme == "javascript" {
+        if let uri = URL(string: uriString),
+            let scheme = uri.scheme, !scheme.isEmpty,
+            let host = uri.host {
+            if allowJS && scheme == "javascript" {
                 return "javascript:"
             }
 
-            realm = "\(uri.scheme!)://\(uri.host!)"
+            realm = "\(scheme)://\(host)"
 
             // If the URI explicitly specified a port, only include it when
             // it's not the default. (We never want "http://foo.com:80")
-            if var port = uri.port {
+            if let port = uri.port {
                 realm? += ":\(port)"
             }
         } else {
@@ -268,11 +354,11 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
      * 3. Applying a merged delta stream to a record. Again, this is unordered, but we
      *    use arrays for convenience.
      */
-    public func deltas(#from: Login) -> LoginDeltas {
+    open func deltas(from: Login) -> LoginDeltas {
         let commutative: [CommutativeLoginField]
 
         if self.timesUsed > 0 && self.timesUsed != from.timesUsed {
-            commutative = [CommutativeLoginField.TimesUsed(increment: self.timesUsed - from.timesUsed)]
+            commutative = [CommutativeLoginField.timesUsed(increment: self.timesUsed - from.timesUsed)]
         } else {
             commutative = []
         }
@@ -280,52 +366,52 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
         var nonCommutative = [NonCommutativeLoginField]()
 
         if self.hostname != from.hostname {
-            nonCommutative.append(NonCommutativeLoginField.Hostname(to: self.hostname))
+            nonCommutative.append(NonCommutativeLoginField.hostname(to: self.hostname))
         }
         if self.password != from.password {
-            nonCommutative.append(NonCommutativeLoginField.Password(to: self.password))
+            nonCommutative.append(NonCommutativeLoginField.password(to: self.password))
         }
         if self.username != from.username {
-            nonCommutative.append(NonCommutativeLoginField.Username(to: self.username))
+            nonCommutative.append(NonCommutativeLoginField.username(to: self.username))
         }
         if self.httpRealm != from.httpRealm {
-            nonCommutative.append(NonCommutativeLoginField.HTTPRealm(to: self.httpRealm))
+            nonCommutative.append(NonCommutativeLoginField.httpRealm(to: self.httpRealm))
         }
         if self.formSubmitURL != from.formSubmitURL {
-            nonCommutative.append(NonCommutativeLoginField.FormSubmitURL(to: self.formSubmitURL))
+            nonCommutative.append(NonCommutativeLoginField.formSubmitURL(to: self.formSubmitURL))
         }
         if self.timeCreated > 0 && self.timeCreated != from.timeCreated {
-            nonCommutative.append(NonCommutativeLoginField.TimeCreated(to: self.timeCreated))
+            nonCommutative.append(NonCommutativeLoginField.timeCreated(to: self.timeCreated))
         }
         if self.timeLastUsed > 0 && self.timeLastUsed != from.timeLastUsed {
-            nonCommutative.append(NonCommutativeLoginField.TimeLastUsed(to: self.timeLastUsed))
+            nonCommutative.append(NonCommutativeLoginField.timeLastUsed(to: self.timeLastUsed))
         }
         if self.timeLastUsed > 0 && self.timePasswordChanged != from.timePasswordChanged {
-            nonCommutative.append(NonCommutativeLoginField.TimePasswordChanged(to: self.timePasswordChanged))
+            nonCommutative.append(NonCommutativeLoginField.timePasswordChanged(to: self.timePasswordChanged))
         }
 
         var nonConflicting = [NonConflictingLoginField]()
 
         if self.passwordField != from.passwordField {
-            nonConflicting.append(NonConflictingLoginField.PasswordField(to: self.passwordField))
+            nonConflicting.append(NonConflictingLoginField.passwordField(to: self.passwordField))
         }
         if self.usernameField != from.usernameField {
-            nonConflicting.append(NonConflictingLoginField.UsernameField(to: self.usernameField))
+            nonConflicting.append(NonConflictingLoginField.usernameField(to: self.usernameField))
         }
 
         return (commutative, nonCommutative, nonConflicting)
     }
 
-    private class func mergeDeltaFields<T: Indexable>(count: Int, a: [T], b: [T], preferBToA: Bool) -> [T] {
-        var deltas = Array<T?>(count: count, repeatedValue: nil)
+    fileprivate class func mergeDeltaFields<T: Indexable>(_ count: Int, a: [T], b: [T], preferBToA: Bool) -> [T] {
+        var deltas = Array<T?>(repeating: nil, count: count)
 
         // Let's start with the 'a's.
-        for (let f) in a {
+        for f in a {
             deltas[f.index] = f
         }
 
         // Then detect any conflicts and fill out the rest.
-        for (let f) in b {
+        for f in b {
             let index = f.index
             if deltas[index] != nil {
                 log.warning("Collision in \(T.self) \(f.index). Using latest.")
@@ -340,7 +426,7 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
         return optFilter(deltas)
     }
 
-    public class func mergeDeltas(#a: TimestampedLoginDeltas, b: TimestampedLoginDeltas) -> LoginDeltas {
+    open class func mergeDeltas(a: TimestampedLoginDeltas, b: TimestampedLoginDeltas) -> LoginDeltas {
         let (aAt, aChanged) = a
         let (bAt, bChanged) = b
         let (aCommutative, aNonCommutative, aNonConflicting) = aChanged
@@ -380,7 +466,7 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
     /**
      * Apply the provided changes to yield a new login.
      */
-    public func applyDeltas(deltas: LoginDeltas) -> Login {
+    open func applyDeltas(_ deltas: LoginDeltas) -> Login {
         let guid = self.guid
         var hostname = self.hostname
         var username = self.username
@@ -394,54 +480,54 @@ public class Login: Printable, LoginData, LoginUsageData, Equatable {
         var timeLastUsed = self.timeLastUsed
         var timePasswordChanged = self.timePasswordChanged
 
-        for (let delta) in deltas.commutative {
+        for delta in deltas.commutative {
             switch delta {
-            case let .TimesUsed(increment):
+            case let .timesUsed(increment):
                 timesUsed += increment
             }
         }
 
-        for (let delta) in deltas.nonCommutative {
+        for delta in deltas.nonCommutative {
             switch delta {
-            case let .Hostname(to):
+            case let .hostname(to):
                 hostname = to
                 break
-            case let .Password(to):
+            case let .password(to):
                 password = to
                 break
-            case let .Username(to):
+            case let .username(to):
                 username = to
                 break
-            case let .HTTPRealm(to):
+            case let .httpRealm(to):
                 httpRealm = to
                 break
-            case let .FormSubmitURL(to):
+            case let .formSubmitURL(to):
                 formSubmitURL = to
                 break
-            case let .TimeCreated(to):
+            case let .timeCreated(to):
                 timeCreated = to
                 break
-            case let .TimeLastUsed(to):
+            case let .timeLastUsed(to):
                 timeLastUsed = to
                 break
-            case let .TimePasswordChanged(to):
+            case let .timePasswordChanged(to):
                 timePasswordChanged = to
                 break
             }
         }
 
-        for (let delta) in deltas.nonConflicting {
+        for delta in deltas.nonConflicting {
             switch delta {
-            case let .UsernameField(to):
+            case let .usernameField(to):
                 usernameField = to
                 break
-            case let .PasswordField(to):
+            case let .passwordField(to):
                 passwordField = to
                 break
             }
         }
 
-        var out = Login(guid: guid, hostname: hostname, username: username!, password: password)
+        let out = Login(guid: guid, hostname: hostname, username: username ?? "", password: password)
         out.timesUsed = timesUsed
         out.httpRealm = httpRealm
         out.formSubmitURL = formSubmitURL
@@ -459,7 +545,7 @@ public func ==(lhs: Login, rhs: Login) -> Bool {
     return lhs.credentials == rhs.credentials && lhs.protectionSpace == rhs.protectionSpace
 }
 
-public class ServerLogin: Login {
+open class ServerLogin: Login {
     var serverModified: Timestamp = 0
 
     public init(guid: String, hostname: String, username: String, password: String, modified: Timestamp) {
@@ -467,7 +553,7 @@ public class ServerLogin: Login {
         super.init(guid: guid, hostname: hostname, username: username, password: password)
     }
 
-    required public init(credential: NSURLCredential, protectionSpace: NSURLProtectionSpace) {
+    required public init(credential: URLCredential, protectionSpace: URLProtectionSpace) {
         super.init(credential: credential, protectionSpace: protectionSpace)
     }
 }
@@ -477,54 +563,58 @@ class MirrorLogin: ServerLogin {
 }
 
 class LocalLogin: Login {
-    var syncStatus: SyncStatus = .Synced
+    var syncStatus: SyncStatus = .synced
     var isDeleted: Bool = false
     var localModified: Timestamp = 0
 }
 
 public protocol BrowserLogins {
-    func getUsageDataForLoginByGUID(guid: GUID) -> Deferred<Result<LoginUsageData>>
-    func getLoginsForProtectionSpace(protectionSpace: NSURLProtectionSpace) -> Deferred<Result<Cursor<LoginData>>>
-    func getLoginsForProtectionSpace(protectionSpace: NSURLProtectionSpace, withUsername username: String?) -> Deferred<Result<Cursor<LoginData>>>
+    func getUsageDataForLoginByGUID(_ guid: GUID) -> Deferred<Maybe<LoginUsageData>>
+    func getLoginDataForGUID(_ guid: GUID) -> Deferred<Maybe<Login>>
+    func getLoginsForProtectionSpace(_ protectionSpace: URLProtectionSpace) -> Deferred<Maybe<Cursor<LoginData>>>
+    func getLoginsForProtectionSpace(_ protectionSpace: URLProtectionSpace, withUsername username: String?) -> Deferred<Maybe<Cursor<LoginData>>>
+    func getAllLogins() -> Deferred<Maybe<Cursor<Login>>>
+    func searchLoginsWithQuery(_ query: String?) -> Deferred<Maybe<Cursor<Login>>>
 
     // Add a new login regardless of whether other logins might match some fields. Callers
     // are responsible for querying first if they care.
-    func addLogin(login: LoginData) -> Success
+    @discardableResult func addLogin(_ login: LoginData) -> Success
 
-    func updateLoginByGUID(guid: GUID, new: LoginData, significant: Bool) -> Success
+    @discardableResult func updateLoginByGUID(_ guid: GUID, new: LoginData, significant: Bool) -> Success
 
     // Add the use of a login by GUID.
-    func addUseOfLoginByGUID(guid: GUID) -> Success
-    func removeLoginByGUID(guid: GUID) -> Success
+    @discardableResult func addUseOfLoginByGUID(_ guid: GUID) -> Success
+    func removeLoginByGUID(_ guid: GUID) -> Success
+    func removeLoginsWithGUIDs(_ guids: [GUID]) -> Success
 
     func removeAll() -> Success
 }
 
-public protocol SyncableLogins {
+public protocol SyncableLogins: AccountRemovalDelegate {
     /**
      * Delete the login with the provided GUID. Succeeds if the GUID is unknown.
      */
-    func deleteByGUID(guid: GUID, deletedAt: Timestamp) -> Success
+    func deleteByGUID(_ guid: GUID, deletedAt: Timestamp) -> Success
 
-    func applyChangedLogin(upstream: ServerLogin) -> Success
+    func applyChangedLogin(_ upstream: ServerLogin) -> Success
 
-    func getModifiedLoginsToUpload() -> Deferred<Result<[Login]>>
-    func getDeletedLoginsToUpload() -> Deferred<Result<[GUID]>>
+    func getModifiedLoginsToUpload() -> Deferred<Maybe<[Login]>>
+    func getDeletedLoginsToUpload() -> Deferred<Maybe<[GUID]>>
 
     /**
      * Chains through the provided timestamp.
      */
-    func markAsSynchronized([GUID], modified: Timestamp) -> Deferred<Result<Timestamp>>
-    func markAsDeleted(guids: [GUID]) -> Success
+    func markAsSynchronized<T: Collection>(_: T, modified: Timestamp) -> Deferred<Maybe<Timestamp>> where T.Iterator.Element == GUID
+    func markAsDeleted<T: Collection>(_ guids: T) -> Success where T.Iterator.Element == GUID
 
     /**
-     * Clean up any metadata.
+     * For inspecting whether we're an active participant in login sync.
      */
-    func onRemovedAccount() -> Success
+    func hasSyncedLogins() -> Deferred<Maybe<Bool>>
 }
 
-public class LoginDataError: ErrorType {
-    public let description: String
+open class LoginDataError: MaybeErrorType {
+    open let description: String
     public init(description: String) {
         self.description = description
     }

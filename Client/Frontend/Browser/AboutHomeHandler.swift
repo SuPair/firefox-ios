@@ -5,22 +5,34 @@
 /**
  * Handles the page request to about/home/ so that the page loads and does not throw an error (404) on initialization
  */
+import GCDWebServers
+
 struct AboutHomeHandler {
-    static func register(webServer: WebServer) {
-        webServer.registerHandlerForMethod("GET", module: "about", resource: "home") { (request: GCDWebServerRequest!) -> GCDWebServerResponse! in
+    static func register(_ webServer: WebServer) {
+        webServer.registerHandlerForMethod("GET", module: "about", resource: "home") { (request: GCDWebServerRequest?) -> GCDWebServerResponse? in
             return GCDWebServerResponse(statusCode: 200)
         }
     }
 }
 
 struct AboutLicenseHandler {
-    static func register(webServer: WebServer) {
-        webServer.registerHandlerForMethod("GET", module: "about", resource: "license") { (request: GCDWebServerRequest!) -> GCDWebServerResponse! in
-            let path = NSBundle.mainBundle().pathForResource("Licenses", ofType: "html")
-            if let html = NSString(contentsOfFile: path!, encoding: NSUTF8StringEncoding, error: nil) as? String {
-                return GCDWebServerDataResponse(HTML: html)
+    static func register(_ webServer: WebServer) {
+        webServer.registerHandlerForMethod("GET", module: "about", resource: "license") { (request: GCDWebServerRequest?) -> GCDWebServerResponse? in
+            let path = Bundle.main.path(forResource: "Licenses", ofType: "html")
+            do {
+                let html = try String(contentsOfFile: path!, encoding: .utf8)
+                return GCDWebServerDataResponse(html: html)
+            } catch {
+                print("Unable to register webserver \(error)")
             }
             return GCDWebServerResponse(statusCode: 200)
-       }
+        }
+    }
+}
+
+extension GCDWebServerDataResponse {
+    convenience init(XHTML: String) {
+        let data = XHTML.data(using: .utf8, allowLossyConversion: false)
+        self.init(data: data, contentType: "application/xhtml+xml; charset=utf-8")
     }
 }

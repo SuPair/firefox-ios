@@ -8,5 +8,4 @@
 
 import Foundation
 
-public protocol ErrorType: Printable {
-}
+public typealias MaybeErrorType = Error & CustomStringConvertible

@@ -4,83 +4,248 @@
 
 import Foundation
 import Shared
-import XCTest
+@testable import Storage
 import XCGLogger
+import Deferred
+import XCTest
 
-private let log = XCGLogger.defaultInstance()
+private let log = XCGLogger.default
 
 class TestSQLiteLogins: XCTestCase {
     var db: BrowserDB!
     var logins: SQLiteLogins!
-    let login = Login.createWithHostname("hostname1", username: "username1", password: "password1")
+
+    let formSubmitURL = "http://submit.me"
+    let login = Login.createWithHostname("hostname1", username: "username1", password: "password1", formSubmitURL: "http://submit.me")
 
     override func setUp() {
         super.setUp()
 
         let files = MockFiles()
-        self.db = BrowserDB(filename: "testsqlitelogins.db", files: files)
+        self.db = BrowserDB(filename: "testsqlitelogins.db", schema: LoginsSchema(), files: files)
         self.logins = SQLiteLogins(db: self.db)
 
-        let expectation = self.expectationWithDescription("Remove all logins.")
+        let expectation = self.expectation(description: "Remove all logins.")
         self.removeAllLogins().upon({ res in expectation.fulfill() })
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
     }
 
     func testAddLogin() {
         log.debug("Created \(self.login)")
-        let expectation = self.expectationWithDescription("Add login")
+        let expectation = self.expectation(description: "Add login")
 
-        addLogin(login) >>>
-            getLoginsFor(login.protectionSpace, expected: [login]) >>>
-            done(expectation)
+        addLogin(login)
+            >>> getLoginsFor(login.protectionSpace, expected: [login])
+            >>> done(expectation)
 
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
     }
 
     func testGetOrder() {
-        let expectation = self.expectationWithDescription("Add login")
+        let expectation = self.expectation(description: "Add login")
 
         // Different GUID.
         let login2 = Login.createWithHostname("hostname1", username: "username2", password: "password2")
+        login2.formSubmitURL = "http://submit.me"
 
-        addLogin(login) >>>
-            { self.addLogin(login2) } >>>
+        addLogin(login) >>> { self.addLogin(login2) } >>>
             getLoginsFor(login.protectionSpace, expected: [login2, login]) >>>
             done(expectation)
 
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
     }
 
     func testRemoveLogin() {
-        let expectation = self.expectationWithDescription("Remove login")
+        let expectation = self.expectation(description: "Remove login")
 
-        addLogin(login) >>>
-            removeLogin(login) >>>
-            getLoginsFor(login.protectionSpace, expected: []) >>>
-            done(expectation)
+        addLogin(login)
+            >>> { self.removeLogin(self.login) }
+            >>> getLoginsFor(login.protectionSpace, expected: [])
+            >>> done(expectation)
 
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
+    }
+
+    func testRemoveLogins() {
+        let loginA = Login.createWithHostname("alphabet.com", username: "username1", password: "password1", formSubmitURL: formSubmitURL)
+        let loginB = Login.createWithHostname("alpha.com", username: "username2", password: "password2", formSubmitURL: formSubmitURL)
+        let loginC = Login.createWithHostname("berry.com", username: "username3", password: "password3", formSubmitURL: formSubmitURL)
+        let loginD = Login.createWithHostname("candle.com", username: "username4", password: "password4", formSubmitURL: formSubmitURL)
+
+        func addLogins() -> Success {
+            addLogin(loginA).succeeded()
+            addLogin(loginB).succeeded()
+            addLogin(loginC).succeeded()
+            addLogin(loginD).succeeded()
+            return succeed()
+        }
+
+        addLogins().succeeded()
+        let guids = [loginA.guid, loginB.guid]
+        logins.removeLoginsWithGUIDs(guids).succeeded()
+        let result = logins.getAllLogins().value.successValue!
+        XCTAssertEqual(result.count, 2)
+    }
+
+    func testRemoveManyLogins() {
+        log.debug("Remove a large number of logins at once")
+        var guids: [GUID] = []
+        for i in 0..<2000 {
+            let login = Login.createWithHostname("mozilla.org", username: "Fire", password: "fox", formSubmitURL: formSubmitURL)
+            if i <= 1000 {
+                guids += [login.guid]
+            }
+            addLogin(login).succeeded()
+        }
+        logins.removeLoginsWithGUIDs(guids).succeeded()
+        let result = logins.getAllLogins().value.successValue!
+        XCTAssertEqual(result.count, 999)
     }
 
     func testUpdateLogin() {
-        let expectation = self.expectationWithDescription("Update login")
-        let updated = Login.createWithHostname("hostname1", username: "username1", password: "password3")
+        let expectation = self.expectation(description: "Update login")
+        let updated = Login.createWithHostname("hostname1", username: "username1", password: "password3", formSubmitURL: formSubmitURL)
         updated.guid = self.login.guid
 
-        addLogin(login) >>>
-            updateLogin(updated) >>>
+        addLogin(login) >>> { self.updateLogin(updated) } >>>
             getLoginsFor(login.protectionSpace, expected: [updated]) >>>
             done(expectation)
 
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
+    }
+
+    func testAddInvalidLogin() {
+        let emptyPasswordLogin = Login.createWithHostname("hostname1", username: "username1", password: "", formSubmitURL: formSubmitURL)
+        var result =  logins.addLogin(emptyPasswordLogin).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with an empty password.")
+
+        let emptyHostnameLogin = Login.createWithHostname("", username: "username1", password: "password", formSubmitURL: formSubmitURL)
+        result =  logins.addLogin(emptyHostnameLogin).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with an empty hostname.")
+
+        let credential = URLCredential(user: "username", password: "password", persistence: .forSession)
+        let protectionSpace = URLProtectionSpace(host: "https://website.com", port: 443, protocol: "https", realm: "Basic Auth", authenticationMethod: "Basic Auth")
+        let bothFormSubmitURLAndRealm = Login.createWithCredential(credential, protectionSpace: protectionSpace)
+        bothFormSubmitURLAndRealm.formSubmitURL = "http://submit.me"
+        result =  logins.addLogin(bothFormSubmitURLAndRealm).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with both a httpRealm and formSubmitURL.")
+
+        let noFormSubmitURLOrRealm = Login.createWithHostname("host", username: "username1", password: "password", formSubmitURL: nil)
+        result =  logins.addLogin(noFormSubmitURLOrRealm).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login without a httpRealm or formSubmitURL.")
+    }
+
+    func testUpdateInvalidLogin() {
+        let updated = Login.createWithHostname("hostname1", username: "username1", password: "", formSubmitURL: formSubmitURL)
+        updated.guid = self.login.guid
+
+        addLogin(login).succeeded()
+        var result = logins.updateLoginByGUID(login.guid, new: updated, significant: true).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with an empty password.")
+
+        let emptyHostnameLogin = Login.createWithHostname("", username: "username1", password: "", formSubmitURL: formSubmitURL)
+        emptyHostnameLogin.guid = self.login.guid
+        result = logins.updateLoginByGUID(login.guid, new: emptyHostnameLogin, significant: true).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with an empty hostname.")
+
+        let credential = URLCredential(user: "username", password: "password", persistence: .forSession)
+        let protectionSpace = URLProtectionSpace(host: "https://website.com", port: 443, protocol: "https", realm: "Basic Auth", authenticationMethod: "Basic Auth")
+        let bothFormSubmitURLAndRealm = Login.createWithCredential(credential, protectionSpace: protectionSpace)
+        bothFormSubmitURLAndRealm.formSubmitURL = "http://submit.me"
+        bothFormSubmitURLAndRealm.guid = self.login.guid
+        result = logins.updateLoginByGUID(login.guid, new: bothFormSubmitURLAndRealm, significant: true).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login with both a httpRealm and formSubmitURL.")
+
+        let noFormSubmitURLOrRealm = Login.createWithHostname("host", username: "username1", password: "password", formSubmitURL: nil)
+        noFormSubmitURLOrRealm.guid = self.login.guid
+        result = logins.updateLoginByGUID(login.guid, new: noFormSubmitURLOrRealm, significant: true).value
+        XCTAssertNil(result.successValue)
+        XCTAssertNotNil(result.failureValue)
+        XCTAssertEqual(result.failureValue?.description, "Can't add a login without a httpRealm or formSubmitURL.")
+    }
+
+    func testSearchLogins() {
+        let loginA = Login.createWithHostname("alphabet.com", username: "username1", password: "password1", formSubmitURL: formSubmitURL)
+        let loginB = Login.createWithHostname("alpha.com", username: "username2", password: "password2", formSubmitURL: formSubmitURL)
+        let loginC = Login.createWithHostname("berry.com", username: "username3", password: "password3", formSubmitURL: formSubmitURL)
+        let loginD = Login.createWithHostname("candle.com", username: "username4", password: "password4", formSubmitURL: formSubmitURL)
+
+        func addLogins() -> Success {
+            addLogin(loginA).succeeded()
+            addLogin(loginB).succeeded()
+            addLogin(loginC).succeeded()
+            addLogin(loginD).succeeded()
+            return succeed()
+        }
+
+        func checkAllLogins() -> Success {
+            return logins.getAllLogins() >>== { results in
+                XCTAssertEqual(results.count, 4)
+                return succeed()
+            }
+        }
+
+        func checkSearchHostnames() -> Success {
+            return logins.searchLoginsWithQuery("pha") >>== { results in
+                XCTAssertEqual(results.count, 2)
+                XCTAssertEqual(results[0]!.hostname, "http://alpha.com")
+                XCTAssertEqual(results[1]!.hostname, "http://alphabet.com")
+                return succeed()
+            }
+        }
+
+        func checkSearchUsernames() -> Success {
+            return logins.searchLoginsWithQuery("username") >>== { results in
+                XCTAssertEqual(results.count, 4)
+                XCTAssertEqual(results[0]!.username, "username2")
+                XCTAssertEqual(results[1]!.username, "username1")
+                XCTAssertEqual(results[2]!.username, "username3")
+                XCTAssertEqual(results[3]!.username, "username4")
+                return succeed()
+            }
+        }
+
+        func checkSearchPasswords() -> Success {
+            return logins.searchLoginsWithQuery("pass") >>== { results in
+                XCTAssertEqual(results.count, 4)
+                XCTAssertEqual(results[0]!.password, "password2")
+                XCTAssertEqual(results[1]!.password, "password1")
+                XCTAssertEqual(results[2]!.password, "password3")
+                XCTAssertEqual(results[3]!.password, "password4")
+                return succeed()
+            }
+        }
+
+        XCTAssertTrue(addLogins().value.isSuccess)
+
+        XCTAssertTrue(checkAllLogins().value.isSuccess)
+        XCTAssertTrue(checkSearchHostnames().value.isSuccess)
+        XCTAssertTrue(checkSearchUsernames().value.isSuccess)
+        XCTAssertTrue(checkSearchPasswords().value.isSuccess)
+
+        XCTAssertTrue(removeAllLogins().value.isSuccess)
     }
 
     /*
     func testAddUseOfLogin() {
-        let expectation = self.expectationWithDescription("Add visit")
+        let expectation = self.self.expectation(description: "Add visit")
 
         if var usageData = login as? LoginUsageData {
-            usageData.timeCreated = NSDate.nowMicroseconds()
+            usageData.timeCreated = Date.nowMicroseconds()
         }
 
         addLogin(login) >>>
@@ -88,44 +253,46 @@ class TestSQLiteLogins: XCTestCase {
             getLoginDetailsFor(login, expected: login as! LoginUsageData) >>>
             done(login.protectionSpace, expectation: expectation)
 
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
     }
     */
 
-    func done(expectation: XCTestExpectation)() -> Success {
-        return removeAllLogins()
-           >>> getLoginsFor(login.protectionSpace, expected: [])
-           >>> {
-                expectation.fulfill()
-                return succeed()
+    func done(_ expectation: XCTestExpectation) -> () -> Success {
+        return {
+            self.removeAllLogins()
+               >>> self.getLoginsFor(self.login.protectionSpace, expected: [])
+               >>> {
+                    expectation.fulfill()
+                    return succeed()
+                }
         }
     }
 
     // Note: These functions are all curried so that we pass arguments, but still chain them below
-    func addLogin(login: LoginData) -> Success {
+    func addLogin(_ login: LoginData) -> Success {
         log.debug("Add \(login)")
         return logins.addLogin(login)
     }
 
-    func updateLogin(login: LoginData)() -> Success {
+    func updateLogin(_ login: LoginData) -> Success {
         log.debug("Update \(login)")
         return logins.updateLoginByGUID(login.guid, new: login, significant: true)
     }
 
-    func addUseDelayed(login: Login, time: UInt32)() -> Success {
+    func addUseDelayed(_ login: Login, time: UInt32) -> Success {
         sleep(time)
-        login.timeLastUsed = NSDate.nowMicroseconds()
+        login.timeLastUsed = Date.nowMicroseconds()
         let res = logins.addUseOfLoginByGUID(login.guid)
         sleep(time)
         return res
     }
 
-    func getLoginsFor(protectionSpace: NSURLProtectionSpace, expected: [LoginData]) -> (() -> Success) {
+    func getLoginsFor(_ protectionSpace: URLProtectionSpace, expected: [LoginData]) -> (() -> Success) {
         return {
             log.debug("Get logins for \(protectionSpace)")
             return self.logins.getLoginsForProtectionSpace(protectionSpace) >>== { results in
                 XCTAssertEqual(expected.count, results.count)
-                for (index, login) in enumerate(expected) {
+                for (index, login) in expected.enumerated() {
                     XCTAssertEqual(results[index]!.username!, login.username!)
                     XCTAssertEqual(results[index]!.hostname, login.hostname)
                     XCTAssertEqual(results[index]!.password, login.password)
@@ -152,7 +319,7 @@ class TestSQLiteLogins: XCTestCase {
     }
     */
 
-    func removeLogin(login: LoginData)() -> Success {
+    func removeLogin(_ login: LoginData) -> Success {
         log.debug("Remove \(login)")
         return logins.removeLoginByGUID(login.guid)
     }
@@ -160,8 +327,78 @@ class TestSQLiteLogins: XCTestCase {
     func removeAllLogins() -> Success {
         log.debug("Remove All")
         // Because we don't want to just mark them as deleted.
-        return self.db.run("DELETE FROM \(TableLoginsMirror)") >>>
-            { self.db.run("DELETE FROM \(TableLoginsLocal)") }
+        return self.db.run("DELETE FROM loginsM") >>> { self.db.run("DELETE FROM loginsL") }
+    }
+}
+
+class TestSQLiteLoginsPerf: XCTestCase {
+    var db: BrowserDB!
+    var logins: SQLiteLogins!
+
+    override func setUp() {
+        super.setUp()
+        let files = MockFiles()
+        self.db = BrowserDB(filename: "testsqlitelogins.db", schema: LoginsSchema(), files: files)
+        self.logins = SQLiteLogins(db: self.db)
+    }
+
+    func testLoginsSearchMatchOnePerf() {
+        populateTestLogins()
+
+        // Measure time to find one entry amongst the 1000 of them
+        self.measureMetrics([XCTPerformanceMetric.wallClockTime], automaticallyStartMeasuring: true) {
+            for _ in 0...5 {
+                self.logins.searchLoginsWithQuery("username500").succeeded()
+            }
+            self.stopMeasuring()
+        }
+
+        XCTAssertTrue(removeAllLogins().value.isSuccess)
+    }
+
+    func testLoginsSearchMatchAllPerf() {
+        populateTestLogins()
+
+        // Measure time to find all matching results
+        self.measureMetrics([XCTPerformanceMetric.wallClockTime], automaticallyStartMeasuring: true) {
+            for _ in 0...5 {
+                self.logins.searchLoginsWithQuery("username").succeeded()
+            }
+            self.stopMeasuring()
+        }
+
+        XCTAssertTrue(removeAllLogins().value.isSuccess)
+    }
+
+    func testLoginsGetAllPerf() {
+        populateTestLogins()
+
+        // Measure time to find all matching results
+        self.measureMetrics([XCTPerformanceMetric.wallClockTime], automaticallyStartMeasuring: true) {
+            self.logins.getAllLogins().succeeded()
+            self.stopMeasuring()
+        }
+
+        XCTAssertTrue(removeAllLogins().value.isSuccess)
+    }
+
+    func populateTestLogins() {
+        var results = [Success]()
+        for i in 0..<1000 {
+            let login = Login.createWithHostname("website\(i).com", username: "username\(i)", password: "password\(i)", formSubmitURL: "test")
+            results.append(addLogin(login))
+        }
+        _ = all(results).value
+    }
+
+    func addLogin(_ login: LoginData) -> Success {
+        return logins.addLogin(login)
+    }
+
+    func removeAllLogins() -> Success {
+        log.debug("Remove All")
+        // Because we don't want to just mark them as deleted.
+        return self.db.run("DELETE FROM loginsM") >>> { self.db.run("DELETE FROM loginsL") }
     }
 }
 
@@ -173,37 +410,36 @@ class TestSyncableLogins: XCTestCase {
         super.setUp()
 
         let files = MockFiles()
-        self.db = BrowserDB(filename: "testsyncablelogins.db", files: files)
+        self.db = BrowserDB(filename: "testsyncablelogins.db", schema: LoginsSchema(), files: files)
         self.logins = SQLiteLogins(db: self.db)
 
-        let expectation = self.expectationWithDescription("Remove all logins.")
+        let expectation = self.expectation(description: "Remove all logins.")
         self.removeAllLogins().upon({ res in expectation.fulfill() })
-        waitForExpectationsWithTimeout(10.0, handler: nil)
+        waitForExpectations(timeout: 10.0, handler: nil)
     }
 
     func removeAllLogins() -> Success {
         log.debug("Remove All")
         // Because we don't want to just mark them as deleted.
-        return self.db.run("DELETE FROM \(TableLoginsMirror)") >>>
-            { self.db.run("DELETE FROM \(TableLoginsLocal)") }
+        return self.db.run("DELETE FROM loginsM") >>> { self.db.run("DELETE FROM loginsL") }
     }
 
     func testDiffers() {
         let guid = "abcdabcdabcd"
         let host = "http://example.com"
         let user = "username"
-        var loginA1 = Login(guid: guid, hostname: host, username: user, password: "password1")
+        let loginA1 = Login(guid: guid, hostname: host, username: user, password: "password1")
         loginA1.formSubmitURL = "\(host)/form1/"
         loginA1.usernameField = "afield"
 
-        var loginA2 = Login(guid: guid, hostname: host, username: user, password: "password1")
+        let loginA2 = Login(guid: guid, hostname: host, username: user, password: "password1")
         loginA2.formSubmitURL = "\(host)/form1/"
         loginA2.usernameField = "somefield"
 
-        var loginB = Login(guid: guid, hostname: host, username: user, password: "password2")
+        let loginB = Login(guid: guid, hostname: host, username: user, password: "password2")
         loginB.formSubmitURL = "\(host)/form1/"
 
-        var loginC = Login(guid: guid, hostname: host, username: user, password: "password")
+        let loginC = Login(guid: guid, hostname: host, username: user, password: "password")
         loginC.formSubmitURL = "\(host)/form2/"
 
         XCTAssert(loginA1.isSignificantlyDifferentFrom(loginB))
@@ -215,7 +451,7 @@ class TestSyncableLogins: XCTestCase {
 
     func testLocalNewStaysNewAndIsRemoved() {
         let guidA = "abcdabcdabcd"
-        var loginA1 = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "password")
+        let loginA1 = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "password")
         loginA1.formSubmitURL = "http://example.com/form/"
         loginA1.timesUsed = 1
         XCTAssertTrue((self.logins as BrowserLogins).addLogin(loginA1).value.isSuccess)
@@ -223,7 +459,7 @@ class TestSyncableLogins: XCTestCase {
         let local1 = self.logins.getExistingLocalRecordByGUID(guidA).value.successValue!
         XCTAssertNotNil(local1)
         XCTAssertEqual(local1!.guid, guidA)
-        XCTAssertEqual(local1!.syncStatus, SyncStatus.New)
+        XCTAssertEqual(local1!.syncStatus, SyncStatus.new)
         XCTAssertEqual(local1!.timesUsed, 1)
 
         XCTAssertTrue(self.logins.addUseOfLoginByGUID(guidA).value.isSuccess)
@@ -232,7 +468,7 @@ class TestSyncableLogins: XCTestCase {
         let local2 = self.logins.getExistingLocalRecordByGUID(guidA).value.successValue!
         XCTAssertNotNil(local2)
         XCTAssertEqual(local2!.guid, guidA)
-        XCTAssertEqual(local2!.syncStatus, SyncStatus.New)
+        XCTAssertEqual(local2!.syncStatus, SyncStatus.new)
         XCTAssertEqual(local2!.timesUsed, 2)
 
         // It's removed immediately, because it was never synced.
@@ -242,7 +478,7 @@ class TestSyncableLogins: XCTestCase {
 
     func testApplyLogin() {
         let guidA = "abcdabcdabcd"
-        var loginA1 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1234)
+        let loginA1 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1234)
         loginA1.formSubmitURL = "http://example.com/form/"
         loginA1.timesUsed = 3
 
@@ -267,7 +503,7 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(mirror!.password, "password")
 
         // Change it.
-        var loginA2 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "newpassword", modified: 2234)
+        let loginA2 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "newpassword", modified: 2234)
         loginA2.formSubmitURL = "http://example.com/form/"
         loginA2.timesUsed = 4
 
@@ -282,7 +518,7 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(changed!.timesUsed, 4)
 
         // Change it locally.
-        let preUse = NSDate.now()
+        let preUse = Date.now()
         XCTAssertTrue(self.logins.addUseOfLoginByGUID(guidA).value.isSuccess)
 
         let localUsed = self.logins.getExistingLocalRecordByGUID(guidA).value.successValue!
@@ -300,17 +536,17 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(mirrorUsed!.serverModified, Timestamp(2234), "Timestamp is new.")
 
         XCTAssertTrue(localUsed!.localModified >= preUse)         // Local record is modified.
-        XCTAssertEqual(localUsed!.syncStatus, SyncStatus.Synced)  // Uses aren't enough to warrant upload.
+        XCTAssertEqual(localUsed!.syncStatus, SyncStatus.synced)  // Uses aren't enough to warrant upload.
 
         // Uses are local until reconciled.
         XCTAssertEqual(localUsed!.timesUsed, 5)
         XCTAssertEqual(mirrorUsed!.timesUsed, 4)
 
         // Change the password and form URL locally.
-        var newLocalPassword = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "yupyup")
+        let newLocalPassword = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "yupyup")
         newLocalPassword.formSubmitURL = "http://example.com/form2/"
 
-        let preUpdate = NSDate.now()
+        let preUpdate = Date.now()
 
         // Updates always bump our usages, too.
         XCTAssertTrue(self.logins.updateLoginByGUID(guidA, new: newLocalPassword, significant: true).value.isSuccess)
@@ -326,7 +562,7 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(localAltered!.password, "yupyup")
         XCTAssertEqual(localAltered!.formSubmitURL!, "http://example.com/form2/")
         XCTAssertTrue(localAltered!.localModified >= preUpdate)
-        XCTAssertEqual(localAltered!.syncStatus, SyncStatus.Changed)              // Changes are enough to warrant upload.
+        XCTAssertEqual(localAltered!.syncStatus, SyncStatus.changed)              // Changes are enough to warrant upload.
         XCTAssertEqual(localAltered!.timesUsed, 6)
         XCTAssertEqual(mirrorAltered!.timesUsed, 4)
     }
@@ -334,7 +570,7 @@ class TestSyncableLogins: XCTestCase {
     func testDeltas() {
         // Shared.
         let guidA = "abcdabcdabcd"
-        var loginA1 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1234)
+        let loginA1 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1234)
         loginA1.timeCreated = 1200
         loginA1.timeLastUsed = 1234
         loginA1.timePasswordChanged = 1200
@@ -346,7 +582,7 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(0, a1a1.nonConflicting.count)
         XCTAssertEqual(0, a1a1.commutative.count)
 
-        var loginA2 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1235)
+        let loginA2 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "password", modified: 1235)
         loginA2.timeCreated = 1200
         loginA2.timeLastUsed = 1235
         loginA2.timePasswordChanged = 1200
@@ -359,28 +595,26 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(1, a1a2.commutative.count)
 
         switch a1a2.commutative[0] {
-        case let .TimesUsed(increment):
+        case let .timesUsed(increment):
             XCTAssertEqual(increment, 1)
             break
-        default:
-            XCTFail("Unexpected commutative login field.")
         }
         switch a1a2.nonCommutative[0] {
-        case let .FormSubmitURL(to):
+        case let .formSubmitURL(to):
             XCTAssertNil(to)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch a1a2.nonCommutative[1] {
-        case let .TimeLastUsed(to):
+        case let .timeLastUsed(to):
             XCTAssertEqual(to, 1235)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
 
-        var loginA3 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "something else", modified: 1280)
+        let loginA3 = ServerLogin(guid: guidA, hostname: "http://example.com", username: "username", password: "something else", modified: 1280)
         loginA3.timeCreated = 1200
         loginA3.timeLastUsed = 1250
         loginA3.timePasswordChanged = 1250
@@ -394,29 +628,27 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertEqual(1, a1a3.commutative.count)
 
         switch a1a3.commutative[0] {
-        case let .TimesUsed(increment):
+        case let .timesUsed(increment):
             XCTAssertEqual(increment, 2)
             break
-        default:
-            XCTFail("Unexpected commutative login field.")
         }
 
         switch a1a3.nonCommutative[0] {
-        case let .Password(to):
+        case let .password(to):
             XCTAssertEqual("something else", to)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch a1a3.nonCommutative[1] {
-        case let .TimeLastUsed(to):
+        case let .timeLastUsed(to):
             XCTAssertEqual(to, 1250)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch a1a3.nonCommutative[2] {
-        case let .TimePasswordChanged(to):
+        case let .timePasswordChanged(to):
             XCTAssertEqual(to, 1250)
             break
         default:
@@ -446,37 +678,37 @@ class TestSyncableLogins: XCTestCase {
         XCTAssertGreaterThanOrEqual(mFCount, max(a2FCount, a3FCount))
 
         switch merged.commutative[0] {
-        case let .TimesUsed(increment):
+        case let .timesUsed(increment):
             XCTAssertEqual(1, increment)
         }
         switch merged.commutative[1] {
-        case let .TimesUsed(increment):
+        case let .timesUsed(increment):
             XCTAssertEqual(2, increment)
         }
 
         switch merged.nonCommutative[0] {
-        case let .Password(to):
+        case let .password(to):
             XCTAssertEqual("something else", to)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch merged.nonCommutative[1] {
-        case let .FormSubmitURL(to):
+        case let .formSubmitURL(to):
             XCTAssertNil(to)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch merged.nonCommutative[2] {
-        case let .TimeLastUsed(to):
+        case let .timeLastUsed(to):
             XCTAssertEqual(to, 1250)
             break
         default:
             XCTFail("Unexpected non-commutative login field.")
         }
         switch merged.nonCommutative[3] {
-        case let .TimePasswordChanged(to):
+        case let .timePasswordChanged(to):
             XCTAssertEqual(to, 1250)
             break
         default:
@@ -484,7 +716,7 @@ class TestSyncableLogins: XCTestCase {
         }
 
         // Applying the merged deltas gives us the expected login.
-        var expected = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "something else")
+        let expected = Login(guid: guidA, hostname: "http://example.com", username: "username", password: "something else")
         expected.timeCreated = 1200
         expected.timeLastUsed = 1250
         expected.timePasswordChanged = 1250
@@ -494,5 +726,16 @@ class TestSyncableLogins: XCTestCase {
         let applied = loginA1.applyDeltas(merged)
         XCTAssertFalse(applied.isSignificantlyDifferentFrom(expected))
         XCTAssertFalse(expected.isSignificantlyDifferentFrom(applied))
+    }
+
+    func testLoginsIsSynced() {
+        let loginA = Login.createWithHostname("alphabet.com", username: "username1", password: "password1")
+        let serverLoginA = ServerLogin(guid: loginA.guid, hostname: "alpha.com", username: "username1", password: "password1", modified: Date.now())
+
+        XCTAssertFalse(logins.hasSyncedLogins().value.successValue ?? true)
+        let _ = logins.addLogin(loginA).value
+        XCTAssertFalse(logins.hasSyncedLogins().value.successValue ?? false)
+        let _ = logins.applyChangedLogin(serverLoginA).value
+        XCTAssertTrue(logins.hasSyncedLogins().value.successValue ?? false)
     }
 }

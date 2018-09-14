@@ -5,28 +5,43 @@
 import UIKit
 
 class SettingsNavigationController: UINavigationController {
-    var profile: Profile!
-    var tabManager: TabManager!
     var popoverDelegate: PresentingModalViewControllerDelegate?
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
-
-        let rootViewController = SettingsTableViewController()
-        rootViewController.profile = profile
-        rootViewController.tabManager = tabManager
-        self.pushViewController(rootViewController, animated: false)
-    }
-
-    func SELdone() {
+    @objc func done() {
         if let delegate = popoverDelegate {
             delegate.dismissPresentedModalViewController(self, animated: true)
         } else {
-            self.dismissViewControllerAnimated(true, completion: nil)
+            self.dismiss(animated: true, completion: nil)
+        }
+    }
+
+    override var preferredStatusBarStyle: UIStatusBarStyle {
+        return ThemeManager.instance.statusBarStyle
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        applyTheme()
+    }
+}
+
+extension SettingsNavigationController: Themeable {
+    func applyTheme() {
+        navigationBar.barTintColor = UIColor.theme.tableView.headerBackground
+        navigationBar.titleTextAttributes = [NSAttributedStringKey.foregroundColor: UIColor.theme.tableView.headerTextDark]
+        setNeedsStatusBarAppearanceUpdate()
+        viewControllers.forEach {
+            ($0 as? Themeable)?.applyTheme()
         }
     }
 }
 
 protocol PresentingModalViewControllerDelegate {
-    func dismissPresentedModalViewController(modalViewController: UIViewController, animated: Bool)
+    func dismissPresentedModalViewController(_ modalViewController: UIViewController, animated: Bool)
+}
+
+class ModalSettingsNavigationController: UINavigationController {
+    override var preferredStatusBarStyle: UIStatusBarStyle {
+        return .default
+    }
 }

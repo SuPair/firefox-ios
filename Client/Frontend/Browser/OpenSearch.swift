@@ -2,55 +2,139 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-import Foundation
 import UIKit
-import SWXMLHash
+import Shared
+import Fuzi
 
 private let TypeSearch = "text/html"
 private let TypeSuggest = "application/x-suggestions+json"
-private let SearchTermsAllowedCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*-_."
 
-class OpenSearchEngine {
+class OpenSearchEngine: NSObject, NSCoding {
     static let PreferredIconSize = 30
 
     let shortName: String
-    let description: String?
-    let image: UIImage?
-    private let searchTemplate: String
-    private let suggestTemplate: String?
+    let engineID: String?
+    let image: UIImage
+    let isCustomEngine: Bool
+    let searchTemplate: String
+    fileprivate let suggestTemplate: String?
 
-    init(shortName: String, description: String?, image: UIImage?, searchTemplate: String, suggestTemplate: String?) {
+    fileprivate let SearchTermComponent = "{searchTerms}"
+    fileprivate let LocaleTermComponent = "{moz:locale}"
+
+    fileprivate lazy var searchQueryComponentKey: String? = self.getQueryArgFromTemplate()
+
+    init(engineID: String?, shortName: String, image: UIImage, searchTemplate: String, suggestTemplate: String?, isCustomEngine: Bool) {
         self.shortName = shortName
-        self.description = description
         self.image = image
         self.searchTemplate = searchTemplate
         self.suggestTemplate = suggestTemplate
+        self.isCustomEngine = isCustomEngine
+        self.engineID = engineID
+    }
+
+    required init?(coder aDecoder: NSCoder) {
+        // this catches the cases where bool encoded in Swift 2 needs to be decoded with decodeObject, but a Bool encoded in swift 3 needs
+        // to be decoded using decodeBool. This catches the upgrade case to ensure that we are always able to fetch a keyed valye for isCustomEngine
+        // http://stackoverflow.com/a/40034694
+        let isCustomEngine = aDecoder.decodeAsBool(forKey: "isCustomEngine")
+        guard let searchTemplate = aDecoder.decodeObject(forKey: "searchTemplate") as? String,
+              let shortName = aDecoder.decodeObject(forKey: "shortName") as? String,
+              let image = aDecoder.decodeObject(forKey: "image") as? UIImage else {
+                assertionFailure()
+                return nil
+        }
+
+        self.searchTemplate = searchTemplate
+        self.shortName = shortName
+        self.isCustomEngine = isCustomEngine
+        self.image = image
+        self.engineID = aDecoder.decodeObject(forKey: "engineID") as? String
+        self.suggestTemplate = nil
+    }
+
+    func encode(with aCoder: NSCoder) {
+        aCoder.encode(searchTemplate, forKey: "searchTemplate")
+        aCoder.encode(shortName, forKey: "shortName")
+        aCoder.encode(isCustomEngine, forKey: "isCustomEngine")
+        aCoder.encode(image, forKey: "image")
+        aCoder.encode(engineID, forKey: "engineID")
     }
 
     /**
      * Returns the search URL for the given query.
      */
-    func searchURLForQuery(query: String) -> NSURL? {
+    func searchURLForQuery(_ query: String) -> URL? {
         return getURLFromTemplate(searchTemplate, query: query)
+    }
+
+    /**
+     * Return the arg that we use for searching for this engine
+     * Problem: the search terms may not be a query arg, they may be part of the URL - how to deal with this?
+     **/
+    fileprivate func getQueryArgFromTemplate() -> String? {
+        // we have the replace the templates SearchTermComponent in order to make the template
+        // a valid URL, otherwise we cannot do the conversion to NSURLComponents
+        // and have to do flaky pattern matching instead.
+        let placeholder = "PLACEHOLDER"
+        let template = searchTemplate.replacingOccurrences(of: SearchTermComponent, with: placeholder)
+        let components = URLComponents(string: template)
+        let searchTerm = components?.queryItems?.filter { item in
+            return item.value == placeholder
+        }
+        guard let term = searchTerm, !term.isEmpty  else { return nil }
+        return term[0].name
+    }
+
+    /**
+     * check that the URL host contains the name of the search engine somewhere inside it
+     **/
+    fileprivate func isSearchURLForEngine(_ url: URL?) -> Bool {
+        guard let urlHost = url?.hostSLD,
+            let queryEndIndex = searchTemplate.range(of: "?")?.lowerBound,
+            let templateURL = URL(string: String(searchTemplate[..<queryEndIndex])) else { return false }
+        return urlHost == templateURL.hostSLD
+    }
+
+    /**
+     * Returns the query that was used to construct a given search URL
+     **/
+    func queryForSearchURL(_ url: URL?) -> String? {
+        if isSearchURLForEngine(url) {
+            if let key = searchQueryComponentKey,
+                let value = url?.getQuery()[key] {
+                return value.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
+            }
+        }
+        return nil
     }
 
     /**
      * Returns the search suggestion URL for the given query.
      */
-    func suggestURLForQuery(query: String) -> NSURL? {
+    func suggestURLForQuery(_ query: String) -> URL? {
         if let suggestTemplate = suggestTemplate {
             return getURLFromTemplate(suggestTemplate, query: query)
         }
-
         return nil
     }
 
-    private func getURLFromTemplate(searchTemplate: String, query: String) -> NSURL? {
-        let allowedCharacters = NSCharacterSet(charactersInString: SearchTermsAllowedCharacters)
+    fileprivate func getURLFromTemplate(_ searchTemplate: String, query: String) -> URL? {
+        if let escapedQuery = query.addingPercentEncoding(withAllowedCharacters: .SearchTermsAllowed) {
+            // Escape the search template as well in case it contains not-safe characters like symbols
+            let templateAllowedSet = NSMutableCharacterSet()
+            templateAllowedSet.formUnion(with: .URLAllowed)
 
-        if let escapedQuery = query.stringByAddingPercentEncodingWithAllowedCharacters(allowedCharacters) {
-            let urlString = searchTemplate.stringByReplacingOccurrencesOfString("{searchTerms}", withString: escapedQuery, options: NSStringCompareOptions.LiteralSearch, range: nil)
-            return NSURL(string: urlString)
+            // Allow brackets since we use them in our template as our insertion point
+            templateAllowedSet.formUnion(with: CharacterSet(charactersIn: "{}"))
+
+            if let encodedSearchTemplate = searchTemplate.addingPercentEncoding(withAllowedCharacters: templateAllowedSet as CharacterSet) {
+                let localeString = Locale.current.identifier
+                let urlString = encodedSearchTemplate
+                    .replacingOccurrences(of: SearchTermComponent, with: escapedQuery, options: .literal, range: nil)
+                    .replacingOccurrences(of: LocaleTermComponent, with: localeString, options: .literal, range: nil)
+                return URL(string: urlString)
+            }
         }
 
         return nil
@@ -66,59 +150,48 @@ class OpenSearchEngine {
  * OpenSearch spec: http://www.opensearch.org/Specifications/OpenSearch/1.1
  */
 class OpenSearchParser {
-    private let pluginMode: Bool
+    fileprivate let pluginMode: Bool
 
     init(pluginMode: Bool) {
         self.pluginMode = pluginMode
     }
 
-    func parse(file: String) -> OpenSearchEngine? {
-        let data = NSData(contentsOfFile: file)
-
-        if data == nil {
-            println("Invalid search file")
+    func parse(_ file: String, engineID: String) -> OpenSearchEngine? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: file)) else {
+            print("Invalid search file")
             return nil
         }
 
-        let rootName = pluginMode ? "SearchPlugin" : "OpenSearchDescription"
-        let docIndexer: XMLIndexer! = SWXMLHash.parse(data!)[rootName][0]
+        guard let indexer = try? XMLDocument(data: data),
+            let docIndexer = indexer.root else {
+                print("Invalid XML document")
+                return nil
+        }
 
-        if docIndexer.element == nil {
-            println("Invalid XML document")
+        let shortNameIndexer = docIndexer.children(tag: "ShortName")
+        if shortNameIndexer.count != 1 {
+            print("ShortName must appear exactly once")
             return nil
         }
 
-        let shortNameIndexer = docIndexer["ShortName"]
-        if shortNameIndexer.all.count != 1 {
-            println("ShortName must appear exactly once")
+        let shortName = shortNameIndexer[0].stringValue
+        if shortName == "" {
+            print("ShortName must contain text")
             return nil
         }
 
-        let shortName = shortNameIndexer.element?.text
-        if shortName == nil {
-            println("ShortName must contain text")
-            return nil
-        }
-
-        let descriptionIndexer = docIndexer["Description"]
-        if !pluginMode && descriptionIndexer.all.count != 1 {
-            println("Description must appear exactly once")
-            return nil
-        }
-        let description = descriptionIndexer.element?.text
-
-        var urlIndexers = docIndexer["Url"].all
+        let urlIndexers = docIndexer.children(tag: "Url")
         if urlIndexers.isEmpty {
-            println("Url must appear at least once")
+            print("Url must appear at least once")
             return nil
         }
 
         var searchTemplate: String!
         var suggestTemplate: String?
         for urlIndexer in urlIndexers {
-            let type = urlIndexer.element?.attributes["type"]
+            let type = urlIndexer.attributes["type"]
             if type == nil {
-                println("Url element requires a type attribute")
+                print("Url element requires a type attribute", terminator: "\n")
                 return nil
             }
 
@@ -127,14 +200,14 @@ class OpenSearchParser {
                 continue
             }
 
-            var template = urlIndexer.element?.attributes["template"]
+            var template = urlIndexer.attributes["template"]
             if template == nil {
-                println("Url element requires a template attribute")
+                print("Url element requires a template attribute", terminator: "\n")
                 return nil
             }
 
             if pluginMode {
-                var paramIndexers = urlIndexer["Param"].all
+                let paramIndexers = urlIndexer.children(tag: "Param")
 
                 if !paramIndexers.isEmpty {
                     template! += "?"
@@ -146,10 +219,10 @@ class OpenSearchParser {
                             firstAdded = true
                         }
 
-                        let name = paramIndexer.element?.attributes["name"]
-                        let value = paramIndexer.element?.attributes["value"]
+                        let name = paramIndexer.attributes["name"]
+                        let value = paramIndexer.attributes["value"]
                         if name == nil || value == nil {
-                            println("Param element must have name and value attributes")
+                            print("Param element must have name and value attributes", terminator: "\n")
                             return nil
                         }
                         template! += name! + "=" + value!
@@ -165,18 +238,18 @@ class OpenSearchParser {
         }
 
         if searchTemplate == nil {
-            println("Search engine must have a text/html type")
+            print("Search engine must have a text/html type")
             return nil
         }
 
-        let imageIndexers = docIndexer["Image"].all
+        let imageIndexers = docIndexer.children(tag: "Image")
         var largestImage = 0
         var largestImageElement: XMLElement?
 
         // TODO: For now, just use the largest icon.
         for imageIndexer in imageIndexers {
-            let imageWidth = imageIndexer.element?.attributes["width"]?.toInt()
-            let imageHeight = imageIndexer.element?.attributes["height"]?.toInt()
+            let imageWidth = Int(imageIndexer.attributes["width"] ?? "")
+            let imageHeight = Int(imageIndexer.attributes["height"] ?? "")
 
             // Only accept square images.
             if imageWidth != imageHeight {
@@ -185,25 +258,23 @@ class OpenSearchParser {
 
             if let imageWidth = imageWidth {
                 if imageWidth > largestImage {
-                    if imageIndexer.element?.text != nil {
-                        largestImage = imageWidth
-                        largestImageElement = imageIndexer.element
-                    }
+                    largestImage = imageWidth
+                    largestImageElement = imageIndexer
                 }
             }
         }
 
-        var uiImage: UIImage?
-
+        let uiImage: UIImage
         if let imageElement = largestImageElement,
-               imageURL = NSURL(string: imageElement.text!),
-               imageData = NSData(contentsOfURL: imageURL),
-               image = UIImage(data: imageData) {
+           let imageURL = URL(string: imageElement.stringValue),
+           let imageData = try? Data(contentsOf: imageURL),
+           let image = UIImage.imageFromDataThreadSafe(imageData) {
             uiImage = image
         } else {
-            println("Error: Invalid search image data")
+            print("Error: Invalid search image data")
+            return nil
         }
 
-        return OpenSearchEngine(shortName: shortName!, description: description, image: uiImage, searchTemplate: searchTemplate, suggestTemplate: suggestTemplate)
+        return OpenSearchEngine(engineID: engineID, shortName: shortName, image: uiImage, searchTemplate: searchTemplate, suggestTemplate: suggestTemplate, isCustomEngine: false)
     }
 }

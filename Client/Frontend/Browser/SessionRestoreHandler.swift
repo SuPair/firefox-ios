@@ -4,20 +4,26 @@
 
 import Foundation
 import WebKit
+import GCDWebServers
+import Shared
 
-/**
- * Handles the page request to about/sessionrestore to restore a crashed session. The page then handles the restoration of the
- * state of the tabs via javascript embedded in the html file and via redirecting the links using the error page custom redirect.
- */
+/// Handles requests to /about/sessionrestore to restore session history.
 struct SessionRestoreHandler {
-    static func register(webServer: WebServer) {
+    static func register(_ webServer: WebServer) {
         // Register the handler that accepts /about/sessionrestore?history=...&currentpage=... requests.
-        webServer.registerHandlerForMethod("GET", module: "about", resource: "sessionrestore") { (request: GCDWebServerRequest!) -> GCDWebServerResponse! in
-            if let sessionRestorePath = NSBundle.mainBundle().pathForResource("SessionRestore", ofType: "html") {
-                if let sessionRestoreString = NSMutableString(contentsOfFile: sessionRestorePath, encoding: NSUTF8StringEncoding, error: nil) {
-                    return GCDWebServerDataResponse(HTML: sessionRestoreString as String)
-                }
+        webServer.registerHandlerForMethod("GET", module: "about", resource: "sessionrestore") { _ in
+            if let sessionRestorePath = Bundle.main.path(forResource: "SessionRestore", ofType: "html") {
+                do {
+                    let sessionRestoreString = try String(contentsOfFile: sessionRestorePath)
+
+                    defer {
+                        NotificationCenter.default.post(name: .DidRestoreSession, object: self)
+                    }
+
+                    return GCDWebServerDataResponse(html: sessionRestoreString)
+                } catch _ {}
             }
+
             return GCDWebServerResponse(statusCode: 404)
         }
     }

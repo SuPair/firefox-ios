@@ -4,170 +4,232 @@
 
 import Foundation
 import WebKit
+import GCDWebServers
 import Shared
+import Storage
 
 class ErrorPageHelper {
     static let MozDomain = "mozilla"
     static let MozErrorDownloadsNotEnabled = 100
 
+    fileprivate static let MessageOpenInSafari = "openInSafari"
+    fileprivate static let MessageCertVisitOnce = "certVisitOnce"
+
     // When an error page is intentionally loaded, its added to this set. If its in the set, we show
     // it as an error page. If its not, we assume someone is trying to reload this page somehow, and
     // we'll instead redirect back to the original URL.
-    private static var redirecting = [NSURL]()
+    fileprivate static var redirecting = [URL]()
 
-    class func cfErrorToName(err: CFNetworkErrors) -> String {
+    fileprivate static weak var certStore: CertStore?
+
+    // Regardless of cause, NSURLErrorServerCertificateUntrusted is currently returned in all cases.
+    // Check the other cases in case this gets fixed in the future.
+    fileprivate static let CertErrors = [
+        NSURLErrorServerCertificateUntrusted,
+        NSURLErrorServerCertificateHasBadDate,
+        NSURLErrorServerCertificateHasUnknownRoot,
+        NSURLErrorServerCertificateNotYetValid
+    ]
+
+    // Error codes copied from Gecko. The ints corresponding to these codes were determined
+    // by inspecting the NSError in each of these cases.
+    fileprivate static let CertErrorCodes = [
+        -9813: "SEC_ERROR_UNKNOWN_ISSUER",
+        -9814: "SEC_ERROR_EXPIRED_CERTIFICATE",
+        -9843: "SSL_ERROR_BAD_CERT_DOMAIN",
+    ]
+
+    class func cfErrorToName(_ err: CFNetworkErrors) -> String {
         switch err {
-        case .CFHostErrorHostNotFound: return "CFHostErrorHostNotFound"
-        case .CFHostErrorUnknown: return "CFHostErrorUnknown"
-        case .CFSOCKSErrorUnknownClientVersion: return "CFSOCKSErrorUnknownClientVersion"
-        case .CFSOCKSErrorUnsupportedServerVersion: return "CFSOCKSErrorUnsupportedServerVersion"
-        case .CFSOCKS4ErrorRequestFailed: return "CFSOCKS4ErrorRequestFailed"
-        case .CFSOCKS4ErrorIdentdFailed: return "CFSOCKS4ErrorIdentdFailed"
-        case .CFSOCKS4ErrorIdConflict: return "CFSOCKS4ErrorIdConflict"
-        case .CFSOCKS4ErrorUnknownStatusCode: return "CFSOCKS4ErrorUnknownStatusCode"
-        case .CFSOCKS5ErrorBadState: return "CFSOCKS5ErrorBadState"
-        case .CFSOCKS5ErrorBadResponseAddr: return "CFSOCKS5ErrorBadResponseAddr"
-        case .CFSOCKS5ErrorBadCredentials: return "CFSOCKS5ErrorBadCredentials"
-        case .CFSOCKS5ErrorUnsupportedNegotiationMethod: return "CFSOCKS5ErrorUnsupportedNegotiationMethod"
-        case .CFSOCKS5ErrorNoAcceptableMethod: return "CFSOCKS5ErrorNoAcceptableMethod"
-        case .CFFTPErrorUnexpectedStatusCode: return "CFFTPErrorUnexpectedStatusCode"
-        case .CFErrorHTTPAuthenticationTypeUnsupported: return "CFErrorHTTPAuthenticationTypeUnsupported"
-        case .CFErrorHTTPBadCredentials: return "CFErrorHTTPBadCredentials"
-        case .CFErrorHTTPConnectionLost: return "CFErrorHTTPConnectionLost"
-        case .CFErrorHTTPParseFailure: return "CFErrorHTTPParseFailure"
-        case .CFErrorHTTPRedirectionLoopDetected: return "CFErrorHTTPRedirectionLoopDetected"
-        case .CFErrorHTTPBadURL: return "CFErrorHTTPBadURL"
-        case .CFErrorHTTPProxyConnectionFailure: return "CFErrorHTTPProxyConnectionFailure"
-        case .CFErrorHTTPBadProxyCredentials: return "CFErrorHTTPBadProxyCredentials"
-        case .CFErrorPACFileError: return "CFErrorPACFileError"
-        case .CFErrorPACFileAuth: return "CFErrorPACFileAuth"
-        case .CFErrorHTTPSProxyConnectionFailure: return "CFErrorHTTPSProxyConnectionFailure"
-        case .CFStreamErrorHTTPSProxyFailureUnexpectedResponseToCONNECTMethod: return "CFStreamErrorHTTPSProxyFailureUnexpectedResponseToCONNECTMethod"
+        case .cfHostErrorHostNotFound: return "CFHostErrorHostNotFound"
+        case .cfHostErrorUnknown: return "CFHostErrorUnknown"
+        case .cfsocksErrorUnknownClientVersion: return "CFSOCKSErrorUnknownClientVersion"
+        case .cfsocksErrorUnsupportedServerVersion: return "CFSOCKSErrorUnsupportedServerVersion"
+        case .cfsocks4ErrorRequestFailed: return "CFSOCKS4ErrorRequestFailed"
+        case .cfsocks4ErrorIdentdFailed: return "CFSOCKS4ErrorIdentdFailed"
+        case .cfsocks4ErrorIdConflict: return "CFSOCKS4ErrorIdConflict"
+        case .cfsocks4ErrorUnknownStatusCode: return "CFSOCKS4ErrorUnknownStatusCode"
+        case .cfsocks5ErrorBadState: return "CFSOCKS5ErrorBadState"
+        case .cfsocks5ErrorBadResponseAddr: return "CFSOCKS5ErrorBadResponseAddr"
+        case .cfsocks5ErrorBadCredentials: return "CFSOCKS5ErrorBadCredentials"
+        case .cfsocks5ErrorUnsupportedNegotiationMethod: return "CFSOCKS5ErrorUnsupportedNegotiationMethod"
+        case .cfsocks5ErrorNoAcceptableMethod: return "CFSOCKS5ErrorNoAcceptableMethod"
+        case .cfftpErrorUnexpectedStatusCode: return "CFFTPErrorUnexpectedStatusCode"
+        case .cfErrorHTTPAuthenticationTypeUnsupported: return "CFErrorHTTPAuthenticationTypeUnsupported"
+        case .cfErrorHTTPBadCredentials: return "CFErrorHTTPBadCredentials"
+        case .cfErrorHTTPConnectionLost: return "CFErrorHTTPConnectionLost"
+        case .cfErrorHTTPParseFailure: return "CFErrorHTTPParseFailure"
+        case .cfErrorHTTPRedirectionLoopDetected: return "CFErrorHTTPRedirectionLoopDetected"
+        case .cfErrorHTTPBadURL: return "CFErrorHTTPBadURL"
+        case .cfErrorHTTPProxyConnectionFailure: return "CFErrorHTTPProxyConnectionFailure"
+        case .cfErrorHTTPBadProxyCredentials: return "CFErrorHTTPBadProxyCredentials"
+        case .cfErrorPACFileError: return "CFErrorPACFileError"
+        case .cfErrorPACFileAuth: return "CFErrorPACFileAuth"
+        case .cfErrorHTTPSProxyConnectionFailure: return "CFErrorHTTPSProxyConnectionFailure"
+        case .cfStreamErrorHTTPSProxyFailureUnexpectedResponseToCONNECTMethod: return "CFStreamErrorHTTPSProxyFailureUnexpectedResponseToCONNECTMethod"
 
-        case .CFURLErrorBackgroundSessionInUseByAnotherProcess: return "CFURLErrorBackgroundSessionInUseByAnotherProcess"
-        case .CFURLErrorBackgroundSessionWasDisconnected: return "CFURLErrorBackgroundSessionWasDisconnected"
-        case .CFURLErrorUnknown: return "CFURLErrorUnknown"
-        case .CFURLErrorCancelled: return "CFURLErrorCancelled"
-        case .CFURLErrorBadURL: return "CFURLErrorBadURL"
-        case .CFURLErrorTimedOut: return "CFURLErrorTimedOut"
-        case .CFURLErrorUnsupportedURL: return "CFURLErrorUnsupportedURL"
-        case .CFURLErrorCannotFindHost: return "CFURLErrorCannotFindHost"
-        case .CFURLErrorCannotConnectToHost: return "CFURLErrorCannotConnectToHost"
-        case .CFURLErrorNetworkConnectionLost: return "CFURLErrorNetworkConnectionLost"
-        case .CFURLErrorDNSLookupFailed: return "CFURLErrorDNSLookupFailed"
-        case .CFURLErrorHTTPTooManyRedirects: return "CFURLErrorHTTPTooManyRedirects"
-        case .CFURLErrorResourceUnavailable: return "CFURLErrorResourceUnavailable"
-        case .CFURLErrorNotConnectedToInternet: return "CFURLErrorNotConnectedToInternet"
-        case .CFURLErrorRedirectToNonExistentLocation: return "CFURLErrorRedirectToNonExistentLocation"
-        case .CFURLErrorBadServerResponse: return "CFURLErrorBadServerResponse"
-        case .CFURLErrorUserCancelledAuthentication: return "CFURLErrorUserCancelledAuthentication"
-        case .CFURLErrorUserAuthenticationRequired: return "CFURLErrorUserAuthenticationRequired"
-        case .CFURLErrorZeroByteResource: return "CFURLErrorZeroByteResource"
-        case .CFURLErrorCannotDecodeRawData: return "CFURLErrorCannotDecodeRawData"
-        case .CFURLErrorCannotDecodeContentData: return "CFURLErrorCannotDecodeContentData"
-        case .CFURLErrorCannotParseResponse: return "CFURLErrorCannotParseResponse"
-        case .CFURLErrorInternationalRoamingOff: return "CFURLErrorInternationalRoamingOff"
-        case .CFURLErrorCallIsActive: return "CFURLErrorCallIsActive"
-        case .CFURLErrorDataNotAllowed: return "CFURLErrorDataNotAllowed"
-        case .CFURLErrorRequestBodyStreamExhausted: return "CFURLErrorRequestBodyStreamExhausted"
-        case .CFURLErrorFileDoesNotExist: return "CFURLErrorFileDoesNotExist"
-        case .CFURLErrorFileIsDirectory: return "CFURLErrorFileIsDirectory"
-        case .CFURLErrorNoPermissionsToReadFile: return "CFURLErrorNoPermissionsToReadFile"
-        case .CFURLErrorDataLengthExceedsMaximum: return "CFURLErrorDataLengthExceedsMaximum"
-        case .CFURLErrorSecureConnectionFailed: return "CFURLErrorSecureConnectionFailed"
-        case .CFURLErrorServerCertificateHasBadDate: return "CFURLErrorServerCertificateHasBadDate"
-        case .CFURLErrorServerCertificateUntrusted: return "CFURLErrorServerCertificateUntrusted"
-        case .CFURLErrorServerCertificateHasUnknownRoot: return "CFURLErrorServerCertificateHasUnknownRoot"
-        case .CFURLErrorServerCertificateNotYetValid: return "CFURLErrorServerCertificateNotYetValid"
-        case .CFURLErrorClientCertificateRejected: return "CFURLErrorClientCertificateRejected"
-        case .CFURLErrorClientCertificateRequired: return "CFURLErrorClientCertificateRequired"
-        case .CFURLErrorCannotLoadFromNetwork: return "CFURLErrorCannotLoadFromNetwork"
-        case .CFURLErrorCannotCreateFile: return "CFURLErrorCannotCreateFile"
-        case .CFURLErrorCannotOpenFile: return "CFURLErrorCannotOpenFile"
-        case .CFURLErrorCannotCloseFile: return "CFURLErrorCannotCloseFile"
-        case .CFURLErrorCannotWriteToFile: return "CFURLErrorCannotWriteToFile"
-        case .CFURLErrorCannotRemoveFile: return "CFURLErrorCannotRemoveFile"
-        case .CFURLErrorCannotMoveFile: return "CFURLErrorCannotMoveFile"
-        case .CFURLErrorDownloadDecodingFailedMidStream: return "CFURLErrorDownloadDecodingFailedMidStream"
-        case .CFURLErrorDownloadDecodingFailedToComplete: return "CFURLErrorDownloadDecodingFailedToComplete"
+        case .cfurlErrorBackgroundSessionInUseByAnotherProcess: return "CFURLErrorBackgroundSessionInUseByAnotherProcess"
+        case .cfurlErrorBackgroundSessionWasDisconnected: return "CFURLErrorBackgroundSessionWasDisconnected"
+        case .cfurlErrorUnknown: return "CFURLErrorUnknown"
+        case .cfurlErrorCancelled: return "CFURLErrorCancelled"
+        case .cfurlErrorBadURL: return "CFURLErrorBadURL"
+        case .cfurlErrorTimedOut: return "CFURLErrorTimedOut"
+        case .cfurlErrorUnsupportedURL: return "CFURLErrorUnsupportedURL"
+        case .cfurlErrorCannotFindHost: return "CFURLErrorCannotFindHost"
+        case .cfurlErrorCannotConnectToHost: return "CFURLErrorCannotConnectToHost"
+        case .cfurlErrorNetworkConnectionLost: return "CFURLErrorNetworkConnectionLost"
+        case .cfurlErrorDNSLookupFailed: return "CFURLErrorDNSLookupFailed"
+        case .cfurlErrorHTTPTooManyRedirects: return "CFURLErrorHTTPTooManyRedirects"
+        case .cfurlErrorResourceUnavailable: return "CFURLErrorResourceUnavailable"
+        case .cfurlErrorNotConnectedToInternet: return "CFURLErrorNotConnectedToInternet"
+        case .cfurlErrorRedirectToNonExistentLocation: return "CFURLErrorRedirectToNonExistentLocation"
+        case .cfurlErrorBadServerResponse: return "CFURLErrorBadServerResponse"
+        case .cfurlErrorUserCancelledAuthentication: return "CFURLErrorUserCancelledAuthentication"
+        case .cfurlErrorUserAuthenticationRequired: return "CFURLErrorUserAuthenticationRequired"
+        case .cfurlErrorZeroByteResource: return "CFURLErrorZeroByteResource"
+        case .cfurlErrorCannotDecodeRawData: return "CFURLErrorCannotDecodeRawData"
+        case .cfurlErrorCannotDecodeContentData: return "CFURLErrorCannotDecodeContentData"
+        case .cfurlErrorCannotParseResponse: return "CFURLErrorCannotParseResponse"
+        case .cfurlErrorInternationalRoamingOff: return "CFURLErrorInternationalRoamingOff"
+        case .cfurlErrorCallIsActive: return "CFURLErrorCallIsActive"
+        case .cfurlErrorDataNotAllowed: return "CFURLErrorDataNotAllowed"
+        case .cfurlErrorRequestBodyStreamExhausted: return "CFURLErrorRequestBodyStreamExhausted"
+        case .cfurlErrorFileDoesNotExist: return "CFURLErrorFileDoesNotExist"
+        case .cfurlErrorFileIsDirectory: return "CFURLErrorFileIsDirectory"
+        case .cfurlErrorNoPermissionsToReadFile: return "CFURLErrorNoPermissionsToReadFile"
+        case .cfurlErrorDataLengthExceedsMaximum: return "CFURLErrorDataLengthExceedsMaximum"
+        case .cfurlErrorSecureConnectionFailed: return "CFURLErrorSecureConnectionFailed"
+        case .cfurlErrorServerCertificateHasBadDate: return "CFURLErrorServerCertificateHasBadDate"
+        case .cfurlErrorServerCertificateUntrusted: return "CFURLErrorServerCertificateUntrusted"
+        case .cfurlErrorServerCertificateHasUnknownRoot: return "CFURLErrorServerCertificateHasUnknownRoot"
+        case .cfurlErrorServerCertificateNotYetValid: return "CFURLErrorServerCertificateNotYetValid"
+        case .cfurlErrorClientCertificateRejected: return "CFURLErrorClientCertificateRejected"
+        case .cfurlErrorClientCertificateRequired: return "CFURLErrorClientCertificateRequired"
+        case .cfurlErrorCannotLoadFromNetwork: return "CFURLErrorCannotLoadFromNetwork"
+        case .cfurlErrorCannotCreateFile: return "CFURLErrorCannotCreateFile"
+        case .cfurlErrorCannotOpenFile: return "CFURLErrorCannotOpenFile"
+        case .cfurlErrorCannotCloseFile: return "CFURLErrorCannotCloseFile"
+        case .cfurlErrorCannotWriteToFile: return "CFURLErrorCannotWriteToFile"
+        case .cfurlErrorCannotRemoveFile: return "CFURLErrorCannotRemoveFile"
+        case .cfurlErrorCannotMoveFile: return "CFURLErrorCannotMoveFile"
+        case .cfurlErrorDownloadDecodingFailedMidStream: return "CFURLErrorDownloadDecodingFailedMidStream"
+        case .cfurlErrorDownloadDecodingFailedToComplete: return "CFURLErrorDownloadDecodingFailedToComplete"
 
-        case .CFHTTPCookieCannotParseCookieFile: return "CFHTTPCookieCannotParseCookieFile"
-        case .CFNetServiceErrorUnknown: return "CFNetServiceErrorUnknown"
-        case .CFNetServiceErrorCollision: return "CFNetServiceErrorCollision"
-        case .CFNetServiceErrorNotFound: return "CFNetServiceErrorNotFound"
-        case .CFNetServiceErrorInProgress: return "CFNetServiceErrorInProgress"
-        case .CFNetServiceErrorBadArgument: return "CFNetServiceErrorBadArgument"
-        case .CFNetServiceErrorCancel: return "CFNetServiceErrorCancel"
-        case .CFNetServiceErrorInvalid: return "CFNetServiceErrorInvalid"
-        case .CFNetServiceErrorTimeout: return "CFNetServiceErrorTimeout"
-        case .CFNetServiceErrorDNSServiceFailure: return "CFNetServiceErrorDNSServiceFailure"
+        case .cfhttpCookieCannotParseCookieFile: return "CFHTTPCookieCannotParseCookieFile"
+        case .cfNetServiceErrorUnknown: return "CFNetServiceErrorUnknown"
+        case .cfNetServiceErrorCollision: return "CFNetServiceErrorCollision"
+        case .cfNetServiceErrorNotFound: return "CFNetServiceErrorNotFound"
+        case .cfNetServiceErrorInProgress: return "CFNetServiceErrorInProgress"
+        case .cfNetServiceErrorBadArgument: return "CFNetServiceErrorBadArgument"
+        case .cfNetServiceErrorCancel: return "CFNetServiceErrorCancel"
+        case .cfNetServiceErrorInvalid: return "CFNetServiceErrorInvalid"
+        case .cfNetServiceErrorTimeout: return "CFNetServiceErrorTimeout"
+        case .cfNetServiceErrorDNSServiceFailure: return "CFNetServiceErrorDNSServiceFailure"
         default: return "Unknown"
         }
     }
 
-    class func register(server: WebServer) {
-        server.registerHandlerForMethod("GET", module: "errors", resource: "error.html", handler: { (request) -> GCDWebServerResponse! in
-            var url: NSURL? = ErrorPageHelper.decodeURL(request.URL)
+    class func register(_ server: WebServer, certStore: CertStore?) {
+        self.certStore = certStore
 
-            if url == nil {
+        server.registerHandlerForMethod("GET", module: "errors", resource: "error.html", handler: { (request) -> GCDWebServerResponse? in
+            guard let url = request?.url.originalURLFromErrorURL else {
                 return GCDWebServerResponse(statusCode: 404)
             }
 
-            if let index = find(self.redirecting, url!) {
-                self.redirecting.removeAtIndex(index)
-
-                let errCode = (request.query["code"] as! String).toInt()
-                let errDescription = request.query["description"] as! String
-                var errDomain = request.query["domain"] as! String
-
-                // If we don't have any other actions, we always add a try again button
-                let tryAgain = NSLocalizedString("Try again", tableName: "ErrorPages", comment: "Shown in error pages on a button that will try to load the page again")
-                var actions = "<button onclick='window.location.reload()'>\(tryAgain)</button>"
-
-                if errDomain == kCFErrorDomainCFNetwork as String {
-                    if let code = CFNetworkErrors(rawValue: Int32(errCode!)) {
-                        errDomain = self.cfErrorToName(code)
-                    }
-                } else if errDomain == ErrorPageHelper.MozDomain {
-                    if errCode == ErrorPageHelper.MozErrorDownloadsNotEnabled {
-                        // Overwrite the normal try-again action.
-                        let downloadInSafari = NSLocalizedString("Open in Safari", tableName: "ErrorPages", comment: "Shown in error pages for files that can't be shown and need to be downloaded.")
-                        actions = "<button onclick='webkit.messageHandlers.errorPageHelperMessageManager.postMessage({type: \"openInSafari\"})'>\(downloadInSafari)</a>"
-                    }
-                    errDomain = ""
-                }
-
-                let asset = NSBundle.mainBundle().pathForResource("NetError", ofType: "html")
-                let response = GCDWebServerDataResponse(HTMLTemplate: asset, variables: [
-                    "error_code": "\(errCode ?? -1)",
-                    "error_title": errDescription ?? "",
-                    "long_description": nil ?? "",
-                    "short_description": errDomain,
-                    "actions": actions
-                ])
-                response.setValue("no cache", forAdditionalHeader: "Pragma")
-                response.setValue("no-cache,must-revalidate", forAdditionalHeader: "Cache-Control")
-                response.setValue(NSDate().description, forAdditionalHeader: "Expires")
-                return response
-            } else {
+            guard let index = self.redirecting.index(of: url) else {
                 return GCDWebServerDataResponse(redirect: url, permanent: false)
             }
+
+            self.redirecting.remove(at: index)
+
+            guard let code = request?.query["code"] as? String,
+                  let errCode = Int(code),
+                  let errDescription = request?.query["description"] as? String,
+                  let errURLString = request?.query["url"] as? String,
+                  let errURLDomain = URL(string: errURLString)?.host,
+                  var errDomain = request?.query["domain"] as? String else {
+                return GCDWebServerResponse(statusCode: 404)
+            }
+
+            var asset = Bundle.main.path(forResource: "NetError", ofType: "html")
+            var variables = [
+                "error_code": "\(errCode)",
+                "error_title": errDescription,
+                "short_description": errDomain,
+            ]
+
+            let tryAgain = NSLocalizedString("Try again", tableName: "ErrorPages", comment: "Shown in error pages on a button that will try to load the page again")
+            var actions = "<button onclick='webkit.messageHandlers.localRequestHelper.postMessage({ type: \"reload\" })'>\(tryAgain)</button>"
+
+            if errDomain == kCFErrorDomainCFNetwork as String {
+                if let code = CFNetworkErrors(rawValue: Int32(errCode)) {
+                    errDomain = self.cfErrorToName(code)
+                }
+            } else if errDomain == ErrorPageHelper.MozDomain {
+                if errCode == ErrorPageHelper.MozErrorDownloadsNotEnabled {
+                    let downloadInSafari = NSLocalizedString("Open in Safari", tableName: "ErrorPages", comment: "Shown in error pages for files that can't be shown and need to be downloaded.")
+
+                    // Overwrite the normal try-again action.
+                    actions = "<button onclick='webkit.messageHandlers.errorPageHelperMessageManager.postMessage({type: \"\(MessageOpenInSafari)\"})'>\(downloadInSafari)</button>"
+                }
+                errDomain = ""
+            } else if CertErrors.contains(errCode) {
+                guard let certError = request?.query["certerror"] as? String else {
+                    return GCDWebServerResponse(statusCode: 404)
+                }
+
+                asset = Bundle.main.path(forResource: "CertError", ofType: "html")
+                actions = "<button onclick='history.back()'>\(Strings.ErrorPagesGoBackButton)</button>"
+                variables["error_title"] = Strings.ErrorPagesCertWarningTitle
+                variables["cert_error"] = certError
+                variables["long_description"] = String(format: Strings.ErrorPagesCertWarningDescription, "<b>\(errURLDomain)</b>")
+                variables["advanced_button"] = Strings.ErrorPagesAdvancedButton
+                variables["warning_description"] = Strings.ErrorPagesCertWarningDescription
+                variables["warning_advanced1"] = Strings.ErrorPagesAdvancedWarning1
+                variables["warning_advanced2"] = Strings.ErrorPagesAdvancedWarning2
+                variables["warning_actions"] =
+                    "<p><a href='javascript:webkit.messageHandlers.errorPageHelperMessageManager.postMessage({type: \"\(MessageCertVisitOnce)\"})'>\(Strings.ErrorPagesVisitOnceButton)</button></p>"
+            }
+
+            variables["actions"] = actions
+
+            let response = GCDWebServerDataResponse(htmlTemplate: asset, variables: variables)
+            response?.setValue("no cache", forAdditionalHeader: "Pragma")
+            response?.setValue("no-cache,must-revalidate", forAdditionalHeader: "Cache-Control")
+            response?.setValue(Date().description, forAdditionalHeader: "Expires")
+            return response
         })
 
-        server.registerHandlerForMethod("GET", module: "errors", resource: "NetError.css", handler: { (request) -> GCDWebServerResponse! in
-            let path = NSBundle(forClass: self).pathForResource("NetError", ofType: "css")!
-            let data = NSString(contentsOfFile: path, encoding: NSUTF8StringEncoding, error: nil)! as String
-            return GCDWebServerDataResponse(data: NSData(contentsOfFile: path), contentType: "text/css")
+        server.registerHandlerForMethod("GET", module: "errors", resource: "NetError.css", handler: { (request) -> GCDWebServerResponse? in
+            let path = Bundle(for: self).path(forResource: "NetError", ofType: "css")!
+            return GCDWebServerDataResponse(data: try? Data(contentsOf: URL(fileURLWithPath: path)), contentType: "text/css")
+        })
+
+        server.registerHandlerForMethod("GET", module: "errors", resource: "CertError.css", handler: { (request) -> GCDWebServerResponse? in
+            let path = Bundle(for: self).path(forResource: "CertError", ofType: "css")!
+            return GCDWebServerDataResponse(data: try? Data(contentsOf: URL(fileURLWithPath: path)), contentType: "text/css")
         })
     }
 
-    func showPage(error: NSError, forUrl url: NSURL, inWebView webView: WKWebView) {
+    func showPage(_ error: NSError, forUrl url: URL, inWebView webView: WKWebView) {
         // Don't show error pages for error pages.
-        if ErrorPageHelper.isErrorPageURL(url) {
-            if let previousUrl = ErrorPageHelper.decodeURL(url),
-               let index = find(ErrorPageHelper.redirecting, previousUrl) {
-                ErrorPageHelper.redirecting.removeAtIndex(index)
+        if url.isErrorPageURL {
+            if let previousURL = url.originalURLFromErrorURL {
+                // If the previous URL is a local file URL that we know exists,
+                // just load it in the web view. This works around an issue
+                // where we are unable to redirect to a `file://` URL during
+                // session restore.
+                if previousURL.isFileURL, FileManager.default.fileExists(atPath: previousURL.path) {
+                    webView.loadFileURL(previousURL, allowingReadAccessTo: previousURL)
+                    return
+                }
+
+                if let index = ErrorPageHelper.redirecting.index(of: previousURL) {
+                    ErrorPageHelper.redirecting.remove(at: index)
+                }
             }
+
             return
         }
 
@@ -175,32 +237,36 @@ class ErrorPageHelper {
         // (instead of redirecting to the original URL).
         ErrorPageHelper.redirecting.append(url)
 
-        let errorUrl = "\(WebServer.sharedInstance.base)/errors/error.html?url=\(url.absoluteString?.escape() ?? String())&code=\(error.code)&domain=\(error.domain)&description=\(error.localizedDescription.escape())"
-        let request = NSURLRequest(URL: errorUrl.asURL!)
-        webView.loadRequest(request)
-    }
+        var components = URLComponents(string: WebServer.sharedInstance.base + "/errors/error.html")!
+        var queryItems = [
+            URLQueryItem(name: "url", value: url.absoluteString),
+            URLQueryItem(name: "code", value: String(error.code)),
+            URLQueryItem(name: "domain", value: error.domain),
+            URLQueryItem(name: "description", value: error.localizedDescription)
+        ]
 
-    class func isErrorPageURL(url: NSURL) -> Bool {
-        if let scheme = url.scheme, host = url.host, path = url.path {
-            return scheme == "http" && host == "localhost" && path == "/errors/error.html"
-        }
-        return false
-    }
+        // If this is an invalid certificate, show a certificate error allowing the
+        // user to go back or continue. The certificate itself is encoded and added as
+        // a query parameter to the error page URL; we then read the certificate from
+        // the URL if the user wants to continue.
+        if ErrorPageHelper.CertErrors.contains(error.code),
+           let certChain = error.userInfo["NSErrorPeerCertificateChainKey"] as? [SecCertificate],
+           let cert = certChain.first,
+           let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError,
+           let certErrorCode = underlyingError.userInfo["_kCFStreamErrorCodeKey"] as? Int {
+            let encodedCert = (SecCertificateCopyData(cert) as Data).base64EncodedString
+            queryItems.append(URLQueryItem(name: "badcert", value: encodedCert))
 
-    class func decodeURL(url: NSURL) -> NSURL? {
-        let query = url.getQuery()
-        if let queryUrl = query["url"] {
-            let escaped = NSURL(string: queryUrl.unescape())
-            if let escaped = escaped where isErrorPageURL(escaped) {
-                return decodeURL(escaped)
-            }
-            return escaped
+            let certError = ErrorPageHelper.CertErrorCodes[certErrorCode] ?? ""
+            queryItems.append(URLQueryItem(name: "certerror", value: String(certError)))
         }
-        return nil
+
+        components.queryItems = queryItems
+        webView.load(PrivilegedRequest(url: components.url!) as URLRequest)
     }
 }
 
-extension ErrorPageHelper: BrowserHelper {
+extension ErrorPageHelper: TabContentScript {
     static func name() -> String {
         return "ErrorPageHelper"
     }
@@ -209,17 +275,35 @@ extension ErrorPageHelper: BrowserHelper {
         return "errorPageHelperMessageManager"
     }
 
-    func userContentController(userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
-        if let url = message.frameInfo.request.URL {
-            if message.frameInfo.mainFrame && ErrorPageHelper.isErrorPageURL(url) {
-                if let res = message.body as? [String: String],
-                   let url = ErrorPageHelper.decodeURL(url) {
-                    let type = res["type"]
-                    if type == "openInSafari" {
-                        UIApplication.sharedApplication().openURL(url)
-                    }
+    func userContentController(_ userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
+        if let errorURL = message.frameInfo.request.url, errorURL.isErrorPageURL,
+           let res = message.body as? [String: String],
+           let originalURL = errorURL.originalURLFromErrorURL,
+           let type = res["type"] {
+
+            switch type {
+            case ErrorPageHelper.MessageOpenInSafari:
+                UIApplication.shared.open(originalURL, options: [:])
+            case ErrorPageHelper.MessageCertVisitOnce:
+                if let cert = certFromErrorURL(errorURL),
+                   let host = originalURL.host {
+                    let origin = "\(host):\(originalURL.port ?? 443)"
+                    ErrorPageHelper.certStore?.addCertificate(cert, forOrigin: origin)
+                    _ = message.webView?.reload()
                 }
+            default:
+                assertionFailure("Unknown error message")
             }
         }
+    }
+
+    fileprivate func certFromErrorURL(_ url: URL) -> SecCertificate? {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        if let encodedCert = components?.queryItems?.filter({ $0.name == "badcert" }).first?.value,
+               let certData = Data(base64Encoded: encodedCert, options: []) {
+            return SecCertificateCreateWithData(nil, certData as CFData)
+        }
+
+        return nil
     }
 }

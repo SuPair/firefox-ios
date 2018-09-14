@@ -8,18 +8,26 @@ import Shared
 
 class SessionData: NSObject, NSCoding {
     let currentPage: Int
-    let urls: [NSURL]
+    let urls: [URL]
     let lastUsedTime: Timestamp
+
+    var jsonDictionary: [String: Any] {
+        return [
+            "currentPage": String(self.currentPage),
+            "lastUsedTime": String(self.lastUsedTime),
+            "urls": urls.map { $0.absoluteString }
+        ]
+    }
 
     /**
         Creates a new SessionData object representing a serialized tab.
 
-        :param: currentPage     The active page index. Must be in the range of (-N, 0],
+        - parameter currentPage:     The active page index. Must be in the range of (-N, 0],
                                 where 1-N is the first page in history, and 0 is the last.
-        :param: urls            The sequence of URLs in this tab's session history.
-        :param: lastUsedTime    The last time this tab was modified.
+        - parameter urls:            The sequence of URLs in this tab's session history.
+        - parameter lastUsedTime:    The last time this tab was modified.
     **/
-    init(currentPage: Int, urls: [NSURL], lastUsedTime: Timestamp) {
+    init(currentPage: Int, urls: [URL], lastUsedTime: Timestamp) {
         self.currentPage = currentPage
         self.urls = urls
         self.lastUsedTime = lastUsedTime
@@ -28,15 +36,15 @@ class SessionData: NSObject, NSCoding {
         assert(currentPage > -urls.count && currentPage <= 0, "Session index is valid")
     }
 
-    required init(coder: NSCoder) {
-        self.currentPage = coder.decodeObjectForKey("currentPage") as? Int ?? 0
-        self.urls = coder.decodeObjectForKey("urls") as? [NSURL] ?? []
-        self.lastUsedTime = UInt64(coder.decodeInt64ForKey("lastUsedTime")) ?? NSDate.now()
+    required init?(coder: NSCoder) {
+        self.currentPage = coder.decodeAsInt(forKey: "currentPage")
+        self.urls = coder.decodeObject(forKey: "urls") as? [URL] ?? []
+        self.lastUsedTime = coder.decodeAsUInt64(forKey: "lastUsedTime")
     }
 
-    func encodeWithCoder(coder: NSCoder) {
-        coder.encodeObject(currentPage, forKey: "currentPage")
-        coder.encodeObject(urls, forKey: "urls")
-        coder.encodeInt64(Int64(lastUsedTime), forKey: "lastUsedTime")
+    func encode(with coder: NSCoder) {
+        coder.encode(currentPage, forKey: "currentPage")
+        coder.encode(urls, forKey: "urls")
+        coder.encode(Int64(lastUsedTime), forKey: "lastUsedTime")
     }
 }
